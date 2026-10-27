@@ -87,14 +87,16 @@ typedef struct __attribute__((packed)) {
 #define clock_time 0.0002    
 #define resistance_for_current 0.001    //電流計測に用いる抵抗値
 #define opamp_gain 16.0                 //cudemxで設定した値
-#define MAX_PHASE_CURRENT_A   30.0f
+#define MAX_PHASE_CURRENT_A   50.0f
 #define drive_voltage 3.3               //マイコンの駆動電圧
 
 #define ENCODER_FAULT_THRESHOLD   30    // スコアがここまで貯まったら停止
 #define ENCODER_FAULT_SCORE_MAX   30    // スコアの上限
 
-#define CAN_MOTOR_CMD_BASE_ID  0x301u
+#define CAN_MOTOR_CMD_BASE_ID  0x302u
 #define CAN_MOTOR_NUM          3u
+
+#define CURRENT_SENSE_RATIO 0.94f       // シャント信号の伝達率
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -158,6 +160,8 @@ static float electrical_direction = 0.0f;
 static float zero_offset_rad = 0.0f;  //初期位置のずれを確認する
 
 uint16_t angle_raw;
+
+volatile uint8_t driver_fault = 0;    // 異常を保持する変数
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -191,10 +195,76 @@ static void motor_emergency_stop(void);
 static HAL_StatusTypeDef stspin_write_reg(uint8_t reg, uint8_t val);
 static HAL_StatusTypeDef stspin_read_reg(uint8_t reg, uint8_t *val);
 static uint8_t stspin_clear_faults(void);
+static int bootstrap_charge(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* 電源投入後の初回起動専用。モーター静止中に使う */
+static int bootstrap_charge(void)
+{
+    const uint16_t low = GPIO_PIN_8 | GPIO_PIN_10 | GPIO_PIN_12;
+
+    const uint16_t all = low | GPIO_PIN_9 | GPIO_PIN_11 | GPIO_PIN_13;
+
+    GPIO_InitTypeDef gpio = {0};      // 端子設定を保存する変数を作り、全項目をいったん0
+    uint8_t status;                   // STSPINから読み取った状態を保存する、8ビットの変数
+
+    /* ビットの状態を確認する: clear_bit(x,y)を呼び出すことで、ビットxの状態を0に設定し、ビットyの状態を確認、タイマ出力を禁止 */
+    CLEAR_BIT(TIM1->BDTR, TIM_BDTR_MOE);                                     // BDTR：出力許可やデッドタイムなどを設定するレジスタ MOE：メイン出力許可
+    CLEAR_BIT(TIM1->CCER, TIM_CCER_CC1E | TIM_CCER_CC1NE | TIM_CCER_CC2E | TIM_CCER_CC2NE | TIM_CCER_CC3E | TIM_CCER_CC3NE);  // 各相の出力許可も、個別にすべてOFFに
+    CLEAR_BIT(TIM1->CR1, TIM_CR1_CEN);                                       // TIM1のカウントを停止  CENはカウンタの動作許可
+
+    /* 6本ともGPIO出力・LOWへ */
+    HAL_GPIO_WritePin(GPIOE, all, GPIO_PIN_RESET);  // 6本分のGPIO出力値を、先にLOWに
+
+    gpio.Pin = all;                                                           // 設定する対象を6本全部に
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;                                          // 端子を、ソフトからHIGH／LOWを指定できる通常の出力に
+    gpio.Pull = GPIO_NOPULL;                                                  // マイコン内部のプルアップ・プルダウン抵抗は使ない
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;                                         // 出力の電圧が変わる速さを低速設定に
+    HAL_GPIO_Init(GPIOE, &gpio);                             // ここまで作った設定を実際の端子に反映
+    HAL_Delay(1);
+
+    /* 出力OFFの状態で起動時の異常を解除 */
+    if (stspin_write_reg(0x09, 0xFF) != HAL_OK) return 0;
+    HAL_Delay(1);
+
+    if (stspin_read_reg(0x80, &status) != HAL_OK) return 0;
+
+    if (status & 0x0F) {
+        printf("BOOT before charge STATUS=0x%02X\r\n",
+               (unsigned int)status);
+        return 0;
+    }
+
+    /* ハイサイドOFF・ローサイドONで充電 */
+    HAL_GPIO_WritePin(GPIOE, low, GPIO_PIN_SET);   // 下側のPE8・PE10・PE12だけをHIGHに
+    HAL_Delay(50);  /* 初期試験値。実機で充電状態を確認 */
+
+    /* 全出力OFFへ */
+    HAL_GPIO_WritePin(GPIOE, all, GPIO_PIN_RESET); // 6本全部をLOWにして、下側もOFFへ戻します
+
+    if (stspin_read_reg(0x80, &status) != HAL_OK) return 0;
+
+    if (status & 0x0F) {
+        printf("BOOT after charge STATUS=0x%02X\r\n",
+               (unsigned int)status);
+        return 0;
+    }
+
+    /* 通常PWMの初期値を反映。まだ出力は禁止中 */
+    set_pwm(0.5f, 0.5f, 0.5f);
+    TIM1->CNT = 0;
+    TIM1->EGR = TIM_EGR_UG;                        // 更新イベントを発生させ、先ほど設定したPWMの比較値などをタイマ内部へ反映
+
+    /* GPIOからTIM1のPWM端子へ戻す */
+    gpio.Mode = GPIO_MODE_AF_PP;                   // 端子を通常のGPIO出力から、周辺機能用の端子へ戻す   
+    gpio.Alternate = GPIO_AF2_TIM1;                // 接続する周辺機能をTIM1に指定
+    HAL_GPIO_Init(GPIOE, &gpio);  // 6本をTIM1のPWM端子へ戻す
+
+    return 1;
+}
+
 static HAL_StatusTypeDef stspin_write_reg(uint8_t reg, uint8_t val)
 {
     return HAL_I2C_Mem_Write(&hi2c3, STSPIN_I2C_ADDR, reg,
@@ -447,7 +517,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     {
         tim2_cnt++;
         
-        if (overcurrent_fault || encoder_fault) {
+        if (overcurrent_fault || encoder_fault || driver_fault) {
           return;
         }
 
@@ -595,7 +665,7 @@ void measure_current(void) {
   uint32_t raw_u = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
   uint32_t raw_w = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_2);
 
-  float magnification_conversion = (drive_voltage / 4096.0f) / (opamp_gain * resistance_for_current);
+  float magnification_conversion = (drive_voltage / 4096.0f) / (opamp_gain * resistance_for_current * CURRENT_SENSE_RATIO);
 
   current_u = ((float)raw_u - (float)offset_u) * magnification_conversion;
   current_w = ((float)raw_w - (float)offset_w) * magnification_conversion;
@@ -748,7 +818,7 @@ int main(void)
   printf("step1: peripherals init done\r\n");
   for(int i=0;i<3;i++){
     motor[i].speed=0.0;
-    motor[i].speed_target=0.0;
+    motor[i].speed_target=200.0;
     if (pid_mode[i] == 0) {
       //n2830
       //motor[i].p=37.0;
@@ -814,24 +884,35 @@ int main(void)
   HAL_GPIO_WritePin(WAKE_GPIO_Port, WAKE_Pin, GPIO_PIN_SET);
   HAL_Delay(100);
 
-  printf("step3: encoder + WAKE done\r\n");
+  // printf("step3: encoder + WAKE done\r\n");
 
-  HAL_Delay(5);
-  stspin_clear_faults();
-  HAL_Delay(5);
-  stspin_clear_faults();   // 念のため2回
+  // HAL_Delay(5);
+  // stspin_clear_faults();
+  // HAL_Delay(5);
+  // stspin_clear_faults();   // 念のため2回
 
-  printf("step4: stspin faults cleared\r\n");
+  // printf("step4: stspin faults cleared\r\n");
 
-  // PWM出力開始
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+  // printf("step4: bootstrap charged\r\n");
 
-  printf("step5: PWM started\r\n");
+  // // PWM出力開始
+  // HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  // HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+  // HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  // HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+  // HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  // HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+
+  // printf("step5: PWM started\r\n");
+
+  if (HAL_TIM_Base_Start(&htim1) != HAL_OK) {
+    printf("TIM1 START FAILED\r\n");
+    fflush(stdout);
+
+    while (1) {
+        HAL_Delay(100);
+    }
+  }
 
   //ADCキャリブレーション＆スタート
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
@@ -871,6 +952,18 @@ int main(void)
   offset_v = sum_v / 100;
   offset_w = sum_w / 100;
 
+  if (offset_u == 0U || offset_w == 0U) {
+    printf("OFFSET FAILED: U=%lu V=%lu W=%lu\r\n",
+           (unsigned long)offset_u,
+           (unsigned long)offset_v,
+           (unsigned long)offset_w);
+    fflush(stdout);
+
+    while (1) {
+        HAL_Delay(100);
+    }
+  }
+
   printf("Offset U:%lu, V:%lu, W:%lu\r\n", offset_u, offset_v, offset_w);
   printf("step9: offset measured U:%lu V:%lu W:%lu\r\n", offset_u, offset_v, offset_w);
 
@@ -882,13 +975,41 @@ int main(void)
 
   printf("step10: injected IT started\r\n");
 
+  /* ゼロ点測定後、通電の直前に充電 */
+  if (!bootstrap_charge()) {
+    printf("BOOTSTRAP FAILED: PWM disabled\r\n");
+    fflush(stdout);
+
+    while (1) {
+        HAL_Delay(100);
+    }
+  }
+
+  /* 通常PWM開始 */
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK ||
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3) != HAL_OK) {
+
+    motor_emergency_stop();
+    printf("PWM START FAILED\r\n");
+
+    while (1) {
+        HAL_Delay(100);
+    }
+  }
+
+  printf("bootstrap charged, PWM started\r\n");
+
   //FCO処理
-  float loaded_zero_offset;
-  if (calib_load(&loaded_zero_offset)) {
-      zero_offset_rad = loaded_zero_offset;
-      printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
-             (int)(zero_offset_rad * 1000));
-  } else {
+  // float loaded_zero_offset;
+  // if (calib_load(&loaded_zero_offset)) {
+  //     zero_offset_rad = loaded_zero_offset;
+  //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
+  //            (int)(zero_offset_rad * 1000));
+  // } else {
       set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
       HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
       zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
@@ -911,7 +1032,7 @@ int main(void)
       if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
         printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
       }
-  }
+  // }
   // TIM2でコントロールループ開始（割り込み）
   HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
@@ -929,16 +1050,33 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    static uint32_t fault_check_cnt = 0;
-    if (++fault_check_cnt >= 5) {   // 200ms×5=1秒
-        fault_check_cnt = 0;
-        uint8_t st = stspin_clear_faults();
-        if (st & 0x04) {
-            printf("VDS protection tripped! cleared.\r\n");
-        }
-        if (st & 0x08) {
-            printf("Device RESET detected! cleared.\r\n");
-        }
+    // static uint32_t fault_check_cnt = 0;
+    // if (++fault_check_cnt >= 5) {   // 200ms×5=1秒
+    //     fault_check_cnt = 0;
+    //     uint8_t st = stspin_clear_faults();
+    //     if (st & 0x04) {
+    //         printf("VDS protection tripped! cleared.\r\n");
+    //     }
+    //     if (st & 0x08) {
+    //         printf("Device RESET detected! cleared.\r\n");
+    //     }
+    // }
+
+    /* 異常解除はせず、読み取りと停止だけ行う */
+    if (!driver_fault) {
+      uint8_t status = 0;
+      HAL_StatusTypeDef result =
+        stspin_read_reg(0x80, &status);
+
+      if (result != HAL_OK || (status & 0x0F)) {
+        driver_fault = 1;
+        motor_emergency_stop();
+
+        printf("DRIVER STOP: I2C=%d STATUS=0x%02X\r\n",
+               (int)result,
+               (unsigned int)status);
+        fflush(stdout);
+      }
     }
 
     
@@ -959,12 +1097,12 @@ int main(void)
     (int)(current_w * 1000000));
     fflush(stdout);
     HAL_Delay(200);
-    if (++fault_check_cnt >= 5) {
-        fault_check_cnt = 0;
-        uint8_t st = stspin_clear_faults();
-        if (st & 0x04) printf("VDS protection tripped! cleared.\r\n");
-        if (st & 0x08) printf("Device RESET detected! cleared.\r\n");
-    }
+    // if (++fault_check_cnt >= 5) {
+    //     fault_check_cnt = 0;
+    //     uint8_t st = stspin_clear_faults();
+    //     if (st & 0x04) printf("VDS protection tripped! cleared.\r\n");
+    //     if (st & 0x08) printf("Device RESET detected! cleared.\r\n");
+    // }
 
     /* CAN受信状況を表示 */
     FDCAN_ProtocolStatusTypeDef pstatus;
