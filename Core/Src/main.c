@@ -93,7 +93,7 @@ typedef struct __attribute__((packed)) {
 #define ENCODER_FAULT_THRESHOLD   30    // スコアがここまで貯まったら停止
 #define ENCODER_FAULT_SCORE_MAX   30    // スコアの上限
 
-#define CAN_MOTOR_CMD_BASE_ID  0x301u
+#define CAN_MOTOR_CMD_BASE_ID  0x303u
 #define CAN_MOTOR_NUM          3u
 /* USER CODE END PD */
 
@@ -455,25 +455,25 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         if (motor[0].speed_target == 0.0f) {
         /* ドリフト防止 */
           if (motor[0].now_speed_target < motor[0].speed_target) {
-            motor[0].now_speed_target += 0.7f;
+            motor[0].now_speed_target += 0.10f;
             if (motor[0].now_speed_target > motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
           }
           if (motor[0].now_speed_target > motor[0].speed_target) {
-            motor[0].now_speed_target -= 0.7f;
+            motor[0].now_speed_target -= 0.10f;
             if (motor[0].now_speed_target < motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
           }
         } 
         else if (motor[0].now_speed_target < motor[0].speed_target) {
-          motor[0].now_speed_target += 0.25f;
+          motor[0].now_speed_target += 0.05f;
           if (motor[0].now_speed_target > motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
         } else if (motor[0].now_speed_target > motor[0].speed_target) {
-          motor[0].now_speed_target -= 0.25f;
+          motor[0].now_speed_target -= 0.05f;
           if (motor[0].now_speed_target < motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
@@ -883,12 +883,12 @@ int main(void)
   printf("step10: injected IT started\r\n");
 
   //FCO処理
-  float loaded_zero_offset;
-  if (calib_load(&loaded_zero_offset)) {
-      zero_offset_rad = loaded_zero_offset;
-      printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
-             (int)(zero_offset_rad * 1000));
-  } else {
+  // float loaded_zero_offset;
+  // if (calib_load(&loaded_zero_offset)) {
+  //     zero_offset_rad = loaded_zero_offset;
+  //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
+  //            (int)(zero_offset_rad * 1000));
+  // } else {
       set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
       HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
       zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
@@ -911,7 +911,7 @@ int main(void)
       if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
         printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
       }
-  }
+  //}
   // TIM2でコントロールループ開始（割り込み）
   HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
