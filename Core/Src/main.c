@@ -93,7 +93,7 @@ typedef struct __attribute__((packed)) {
 #define ENCODER_FAULT_THRESHOLD   30    // スコアがここまで貯まったら停止
 #define ENCODER_FAULT_SCORE_MAX   30    // スコアの上限
 
-#define CAN_MOTOR_CMD_BASE_ID  0x303u
+#define CAN_MOTOR_CMD_BASE_ID  0x302u
 #define CAN_MOTOR_NUM          3u
 /* USER CODE END PD */
 
@@ -369,6 +369,7 @@ void update_openloop(float voltage)
     static float filtered_speed = 0.0;
     static int speed_calc_cnt = 0;
     static uint16_t angle_at_last_calc = 0;
+    static uint8_t speed_initialized = 0;
 
     uint8_t enc_bad = 0;
     angle_raw = as5047p_read_angle_checked(&enc_bad);
@@ -386,6 +387,18 @@ void update_openloop(float voltage)
     }
 
     if (enc_bad || encoder_fault) return;
+
+    /* 最初の正常な角度を、速度計算の基準にする */
+    if (!speed_initialized) {
+      angle_at_last_calc = angle_raw;
+      speed_calc_cnt = 0;
+      filtered_speed = 0.0f;
+      speed_now = 0.0f;
+      motor[0].speed = 0.0f;
+
+      speed_initialized = 1;
+      return;  /* 初回は速度差分を計算しない */
+    }
 
     float angle_mech = ((float)angle_raw / 16384.0f) * 2.0f * M_PI;
     static float motor_direction = 1.0f;
@@ -455,25 +468,25 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         if (motor[0].speed_target == 0.0f) {
         /* ドリフト防止 */
           if (motor[0].now_speed_target < motor[0].speed_target) {
-            motor[0].now_speed_target += 0.10f;
+            motor[0].now_speed_target += 0.05f;
             if (motor[0].now_speed_target > motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
           }
           if (motor[0].now_speed_target > motor[0].speed_target) {
-            motor[0].now_speed_target -= 0.10f;
+            motor[0].now_speed_target -= 0.05f;
             if (motor[0].now_speed_target < motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
           }
         } 
         else if (motor[0].now_speed_target < motor[0].speed_target) {
-          motor[0].now_speed_target += 0.05f;
+          motor[0].now_speed_target += 0.03f;
           if (motor[0].now_speed_target > motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
         } else if (motor[0].now_speed_target > motor[0].speed_target) {
-          motor[0].now_speed_target -= 0.05f;
+          motor[0].now_speed_target -= 0.03f;
           if (motor[0].now_speed_target < motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
@@ -889,9 +902,47 @@ int main(void)
   //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
   //            (int)(zero_offset_rad * 1000));
   // } else {
-      set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
-      HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
-      zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
+      // set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
+      // HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
+      // zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
+  uint8_t align_bad_before = 0;
+  uint8_t align_bad_after = 0;
+
+  uint16_t align_before = as5047p_read_angle_checked(&align_bad_before);
+
+  set_pwm(0.58f, 0.46f, 0.46f);
+  HAL_Delay(1000);
+
+  uint16_t align_after = as5047p_read_angle_checked(&align_bad_after);
+
+  uint8_t align_status = 0xFF;
+  HAL_StatusTypeDef align_i2c =
+  stspin_read_reg(0x80, &align_status);
+
+  printf(
+    "ALIGN before=%u after=%u bad_before=%u bad_after=%u "
+    "I2C=%d STATUS=0x%02X\r\n",
+    (unsigned int)align_before,
+    (unsigned int)align_after,
+    (unsigned int)align_bad_before,
+    (unsigned int)align_bad_after,
+    (int)align_i2c,
+    (unsigned int)align_status);
+  fflush(stdout);
+
+  /* 通信・ドライバ異常がある状態では原点を採用しない */
+  if (align_bad_before || align_bad_after || align_i2c != HAL_OK || (align_status & 0x0F)) {
+
+    motor_emergency_stop();
+    printf("ALIGN FAILED: stopped\r\n");
+    fflush(stdout);
+
+    while (1) {
+        HAL_Delay(100);
+    }
+  }
+
+  zero_offset_rad = ((float)align_after / 16384.0f) * 2.0f * M_PI;
 
       if (calib_save(zero_offset_rad) == HAL_OK) {
           printf("step11: FCO lock done, saved to flash, zero_offset_rad=%d\r\n",
