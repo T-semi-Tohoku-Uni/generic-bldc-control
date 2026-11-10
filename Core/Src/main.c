@@ -439,6 +439,7 @@ void update_openloop(float voltage)
     static float filtered_speed = 0.0;
     static int speed_calc_cnt = 0;
     static uint16_t angle_at_last_calc = 0;
+    static uint8_t speed_initialized = 0;
 
     uint8_t enc_bad = 0;
     angle_raw = as5047p_read_angle_checked(&enc_bad);
@@ -456,6 +457,16 @@ void update_openloop(float voltage)
     }
 
     if (enc_bad || encoder_fault) return;
+
+    if (!speed_initialized) {
+      angle_at_last_calc = angle_raw;
+      speed_calc_cnt = 0;
+      filtered_speed = 0.0f;
+      speed_now = 0.0f;
+      motor[0].speed = 0.0f;
+      speed_initialized = 1;
+      return;
+    }
 
     float angle_mech = ((float)angle_raw / 16384.0f) * 2.0f * M_PI;
     static float motor_direction = 1.0f;
