@@ -440,12 +440,13 @@ void update_openloop(float voltage)
     static float filtered_speed = 0.0;
     static int speed_calc_cnt = 0;
     static uint16_t angle_at_last_calc = 0;
-    static uint8_t speed_initialized = 0;
+    static uint8_t speed_initialized = 0;  //関数の初期化が行われたか確認する変数
 
+    /* エラー処理一覧*/
     uint8_t enc_bad = 0;
     angle_raw = as5047p_read_angle_checked(&enc_bad);
 
-    /* リーキーバケット: 異常で+1、正常で-1。単発ノイズでは閾値に届きにくい */
+    /* リーキーバケット: 異常で+1、正常で-1。単発ノイズでは閾値に届きにくい */    
     if (enc_bad) {
         if (encoder_fault_score < ENCODER_FAULT_SCORE_MAX) encoder_fault_score++;
     } else {
@@ -459,6 +460,7 @@ void update_openloop(float voltage)
 
     if (enc_bad || encoder_fault) return;
 
+    /* この関数の初期化処理*/
     if (!speed_initialized) {
       angle_at_last_calc = angle_raw;
       speed_calc_cnt = 0;
@@ -469,58 +471,38 @@ void update_openloop(float voltage)
       return;
     }
 
-    float angle_mech = ((float)angle_raw / 16384.0f) * 2.0f * M_PI;
-    static float motor_direction = 1.0f;
-    electrical_direction = (angle_mech - zero_offset_rad) * POLE_PAIRS * motor_direction;
+    float angle_mech = ((float)angle_raw / 16384.0f) * 2.0f * M_PI;                       // 軸が実際にどれだけ回ったかをラジアンにした値
+    static float motor_direction = 1.0f;                                                  // 
+    electrical_direction = (angle_mech - zero_offset_rad) * POLE_PAIRS * motor_direction; // モーターの磁石の向きに合わせて電流や電圧を計算するための角度
 
     // 速度計算は25回に1回(5ms間隔)だけ行う
     speed_calc_cnt++;
     if (speed_calc_cnt >= 25) {
-        speed_calc_cnt = 0;
-        int16_t diff = (int16_t)angle_raw - (int16_t)angle_at_last_calc;
-        if (diff > 8192)  diff -= 16384;
-        if (diff < -8192) diff += 16384;
-        angle_at_last_calc = angle_raw;
+      speed_calc_cnt = 0;
+      int16_t diff = (int16_t)angle_raw - (int16_t)angle_at_last_calc;
+      /* 角度が一周の境界をまたいだときの補正 */
+      if (diff > 8192)  diff -= 16384;
+      if (diff < -8192) diff += 16384;
+      angle_at_last_calc = angle_raw;
 
-        speed_now = ((float)diff / 16384.0f) / (clock_time * 25.0f) * 60.0f;
-        filtered_speed = filtered_speed * 0.7f + speed_now * 0.3f;
-        motor[0].speed = filtered_speed;
+      speed_now = ((float)diff / 16384.0f) / (clock_time * 25.0f) * 60.0f;
+      filtered_speed = filtered_speed * 0.7f + speed_now * 0.3f;
+      motor[0].speed = filtered_speed;
     }
   
     float vd;
     float vq;
     if (control_motor_mode[0] == 2) {
 
-      static uint8_t test_started = 0;    // 試験の時計を開始したか
-      static uint8_t test_finished = 0;   // 試験が終了したか
-      static uint32_t test_start_ms = 0;  // 時計を開始した時刻
-
-      if (test_finished) {                // 一度終了したら
-        return;                         // 次の制御周期でも試験を再開しない
-      }
-
-      if (!test_started) {                // 最初にこのブロックへ来たときだけ
-        test_start_ms = HAL_GetTick();  // 現在時刻を保存する
-        test_started = 1;               // 次回から開始時刻を上書きしない
-      }
-
-      /* 今回の電気角を使って、電流PIに入れる Id / Iq を計算 */
       measure_current();
-      if (overcurrent_fault) {            // 既存の過電流保護が作動したら
-        return;                         // PWMの更新まで進まない
-      }
-
-      uint32_t elapsed_ms = HAL_GetTick() - test_start_ms;  // 開始からの経過時間
-      if (elapsed_ms < 2000U) {                             // 最初の2秒は待機
-        set_pwm(0.5f, 0.5f, 0.5f);             // 3相のデューティを等しくする
+      if (overcurrent_fault) {
         return;
       }
 
-
-      if (elapsed_ms >= 10000U || fabsf(current_u) > CURRENT_TEST_ABORT_A || fabsf(current_v) > CURRENT_TEST_ABORT_A || fabsf(current_w) > CURRENT_TEST_ABORT_A) {
+      if (fabsf(current_u) > CURRENT_TEST_ABORT_A || fabsf(current_v) > CURRENT_TEST_ABORT_A || fabsf(current_w) > CURRENT_TEST_ABORT_A) {
         motor[0].current_p_target = 0.0f;
-        test_finished = 1;                                 // 試験終了を記録する
-        motor_emergency_stop();                            // 3相のPWM出力を停止する
+        overcurrent_fault = 1;
+        motor_emergency_stop();
         return;
       }
 
@@ -532,29 +514,15 @@ void update_openloop(float voltage)
       motor[0].current_d_target = 0.0f;
       motor[0].current_p_target = iq_target;
 
-      vd = locate_pid(
-          motor[0].current_d, motor[0].current_d_target,
-          motor[0].current_d_pgain, motor[0].current_d_igain, 0.0f,
-          &motor[0].current_d_different_sum,
-          &motor[0].current_d_low_pass_different_sum,
-          &motor[0].current_d_last_difference,
-          cutoff, CURRENT_TEST_OUTPUT_MAX
-      );
-      vq = locate_pid(
-          motor[0].current_p, motor[0].current_p_target,
-          motor[0].current_p_pgain, motor[0].current_p_igain, 0.0f,
-          &motor[0].current_p_different_sum,
-          &motor[0].current_p_low_pass_different_sum,
-          &motor[0].current_p_last_difference,
-          cutoff, CURRENT_TEST_OUTPUT_MAX
-      );
+      vd = locate_pid(motor[0].current_d, motor[0].current_d_target,motor[0].current_d_pgain, motor[0].current_d_igain, 0.0f,&motor[0].current_d_different_sum,&motor[0].current_d_low_pass_different_sum,&motor[0].current_d_last_difference,cutoff, CURRENT_TEST_OUTPUT_MAX);
+      vq = locate_pid(motor[0].current_p, motor[0].current_p_target,motor[0].current_p_pgain, motor[0].current_p_igain, 0.0f,&motor[0].current_p_different_sum,&motor[0].current_p_low_pass_different_sum,&motor[0].current_p_last_difference,cutoff, CURRENT_TEST_OUTPUT_MAX);
 
-      }
-      else{
-        /*座標返還*/
-        vd = 0.0f;
-        vq = voltage;                             
-      }
+    }
+    else{
+      /*座標返還*/
+      vd = 0.0f;
+      vq = voltage;                             
+    }
     
     float va = vd * fast_cos(electrical_direction) - vq * fast_sin(electrical_direction);
     float vb = vd * fast_sin(electrical_direction) + vq * fast_cos(electrical_direction);
@@ -575,10 +543,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     {
         tim2_cnt++;
         
+        /*以上があったら停止*/
         if (overcurrent_fault || encoder_fault || driver_fault) {
           return;
         }
 
+        /* モード1は計測だけなので処理を打ち切る*/
         if (control_motor_mode[0] == 1) {
             measure_current();
             return;
@@ -588,28 +558,36 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         if (motor[0].speed_target == 0.0f) {
         /* ドリフト防止 */
           if (motor[0].now_speed_target < motor[0].speed_target) {
+
             motor[0].now_speed_target += 0.7f;
             if (motor[0].now_speed_target > motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
+
           }
           if (motor[0].now_speed_target > motor[0].speed_target) {
+
             motor[0].now_speed_target -= 0.7f;
             if (motor[0].now_speed_target < motor[0].speed_target) {
               motor[0].now_speed_target = motor[0].speed_target;
             }
+
           }
         } 
         else if (motor[0].now_speed_target < motor[0].speed_target) {
+
           motor[0].now_speed_target += 0.25f;
           if (motor[0].now_speed_target > motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
+
         } else if (motor[0].now_speed_target > motor[0].speed_target) {
+
           motor[0].now_speed_target -= 0.25f;
           if (motor[0].now_speed_target < motor[0].speed_target) {
             motor[0].now_speed_target = motor[0].speed_target;
           }
+
         }
         
         if (control_motor_mode[0] == 2) {
@@ -617,30 +595,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             return;
         }
 
-        float voltage_out = 0.0f;  // ← スコープを外に出す
+        float voltage_out = 0.0f;  // 速度PIDの計算結果を入れる箱
 
         if (pid_mode[0] == 0) {
-          voltage_out = locate_pid(motor[0].speed, motor[0].now_speed_target,
-          motor[0].p, motor[0].i, motor[0].d,
-          &motor[0].different_sum, &motor[0].low_pass_different_sum,
-          &motor[0].last_difference, cutoff, 16384.0f);
+          voltage_out = locate_pid(motor[0].speed, motor[0].now_speed_target,motor[0].p, motor[0].i, motor[0].d,&motor[0].different_sum, &motor[0].low_pass_different_sum, &motor[0].last_difference, cutoff, 16384.0f);
         }
 
         if (pid_mode[0] == 1) {
-          voltage_out = speed_pid(
-            motor[0].speed,
-            motor[0].now_speed_target,
-            motor[0].p,
-            motor[0].i,
-            motor[0].d,
-            &motor[0].low_pass_different_sum,
-            &motor[0].last_difference,
-            &motor[0].last_last_difference,
-            motor[0].last_input,
-            &motor[0].low_pass_derivative,
-            cutoff
-    );
-    motor[0].last_input = voltage_out;
+          voltage_out = speed_pid(motor[0].speed, motor[0].now_speed_target, motor[0].p, motor[0].i, motor[0].d, &motor[0].low_pass_different_sum, &motor[0].last_difference, &motor[0].last_last_difference, motor[0].last_input, &motor[0].low_pass_derivative, cutoff);
+          motor[0].last_input = voltage_out;
         }
 
         // locate_pidとspeed_pidの出力は-16384〜16384なので0〜0.3にスケール変換
