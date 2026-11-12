@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <complex.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -53,10 +54,8 @@ typedef struct {
     volatile float current_p_last_difference; 
     volatile float current_d_pgain;
     volatile float current_d_igain;
-    volatile float current_d_dgain;
     volatile float current_p_pgain;
     volatile float current_p_igain;
-    volatile float current_p_dgain;
 }pid_items;
 
 pid_items motor[3];
@@ -96,15 +95,10 @@ typedef struct __attribute__((packed)) {
 #define CAN_MOTOR_CMD_BASE_ID  0x302u
 #define CAN_MOTOR_NUM          3u
 
-#define CURRENT_SENSE_RATIO 0.94f       // シャント信号の伝達率
+#define CURRENT_SENSE_RATIO     0.94f   // シャント信号の伝達率
  
-#define CURRENT_TEST_ENABLE       1     // 1で試験コードを有効、0で通常の制御分岐に戻す
-#define CURRENT_TEST_KP           0.01f // 今の電流誤差にどれだけ反応するか 
-#define CURRENT_TEST_KI           0.10f // 残り続ける電流誤差をどれだけ補正するか
-#define CURRENT_TEST_OUTPUT_MAX   0.15f// d軸・q軸それぞれの正規化電圧指令を±0.015に制限
+#define CURRENT_TEST_OUTPUT_MAX   0.15f// d軸・q軸それぞれの正規化電圧指令を±0.15に制限
 #define CURRENT_TEST_ABORT_A      25.0f // U・V・Wのどれかが絶対値25Aを超えたら試験停止
-#define CURRENT_TEST_SPEED_RPM    200.0f
-#define CURRENT_TEST_SPEED_KP      0.016f  // 速度誤差1 rpmあたり0.01 A
 #define CURRENT_TEST_IQ_MAX_A      0.8f
 /* USER CODE END PD */
 
@@ -142,7 +136,7 @@ static inline float fast_sin(float x) { return sinf(x); }
 static inline float fast_cos(float x) { return cosf(x); }
 
 volatile int pid_mode[3] = {0, 0, 0};             //0ならlocate_pid 1ならspeed_pid
-volatile int control_motor_mode[3] = {1, 1, 1};   //モーターの制御モード
+volatile int control_motor_mode[3] = {2,1,1};   //モーターの制御モード
 
 volatile uint32_t rx_ok_count = 0;
 static volatile uint32_t tim2_cnt = 0;
@@ -193,7 +187,7 @@ static void MX_OPAMP3_Init(void);
 static void MX_TIM8_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-float locate_pid(volatile float output, float target, float p, float i, float d,volatile float *different_sum, volatile float *low_pass_different_sum,volatile float *last_difference, int cutoff);
+float locate_pid(volatile float output, float target, float p, float i, float d,volatile float *different_sum, volatile float *low_pass_different_sum,volatile float *last_difference, int cutoff, float output_limit);
 float speed_pid(volatile float output, float target, float p, float i, float d, volatile float *low_pass_different_sum, volatile float *last_difference, volatile float *last_last_difference, volatile float last_input, volatile float *low_pass_derivative, int cutoff);
 void measure_current(void);
 static void FDCAN1_ConfigFilterAndStart(void);
@@ -209,27 +203,6 @@ static int bootstrap_charge(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-/* 電源投入後の初回起動専用。モーター静止中に使う */
-#if CURRENT_TEST_ENABLE               // 試験が有効なビルドで、この関数を使う
-static float test_current_pi(float target, float measured, float *integral)
-{
-    // targetは目標電流、measuredは実測電流。どちらもA
-    // integralは、その軸が前回までにためた積分補正値のアドレス
-    float error = target - measured;
-    float next_integral = *integral + CURRENT_TEST_KI * error * clock_time;  // 今回の誤差を、1周期分だけ積分した場合の候補を作る
-    float output = CURRENT_TEST_KP * error + next_integral;                  // 今の誤差に反応するP項と、積み上げたI項を足す
-
-    // 上限超えで誤差が正、または下限超えで誤差が負かを調べる
-    if ((output > CURRENT_TEST_OUTPUT_MAX && error > 0.0f) || (output < -CURRENT_TEST_OUTPUT_MAX && error < 0.0f)) {
-       output = CURRENT_TEST_KP * error + *integral;  // 積分を増やすとさらに上限・下限を超えるので、前回の積分値を使う
-    } else {
-        *integral = next_integral;                    // 今回の積分値を保存して、次の周期でも使えるようにする
-    }
-
-    return fminf(CURRENT_TEST_OUTPUT_MAX, fmaxf(-CURRENT_TEST_OUTPUT_MAX, output));  // fmaxfで下限、fminfで上限をかけて返す
-}
-#endif
 
 static int bootstrap_charge(void)
 {
@@ -375,7 +348,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     /* 0x301/0x302/0x303どれで来ても、motor[0]で固定している。使用するロボットでは別々の基盤にcanで送信して動かすため */
     motor[0].speed_target       = cmd.speed_target;
     pid_mode[0]                 = cmd.pid_mode ? 1 : 0;
-    control_motor_mode[0]       = cmd.control_motor_mode ? 1 : 0;
+    control_motor_mode[0]       = cmd.control_motor_mode ? 2 : 0;
 
     rx_ok_count++;
 }
@@ -516,75 +489,73 @@ void update_openloop(float voltage)
   
     float vd;
     float vq;
-#if CURRENT_TEST_ENABLE
-    static uint8_t test_started = 0;    // 試験の時計を開始したか
-    static uint8_t test_finished = 0;   // 試験が終了したか
-    static uint32_t test_start_ms = 0;  // 時計を開始した時刻
-    static float id_integral = 0.0f;    // d軸用の積分補正値
-    static float iq_integral = 0.0f;    // q軸用の積分補正値
+    if (control_motor_mode[0] == 2) {
 
-    if (test_finished) {                // 一度終了したら
+      static uint8_t test_started = 0;    // 試験の時計を開始したか
+      static uint8_t test_finished = 0;   // 試験が終了したか
+      static uint32_t test_start_ms = 0;  // 時計を開始した時刻
+
+      if (test_finished) {                // 一度終了したら
         return;                         // 次の制御周期でも試験を再開しない
-    }
+      }
 
-    if (!test_started) {                // 最初にこのブロックへ来たときだけ
+      if (!test_started) {                // 最初にこのブロックへ来たときだけ
         test_start_ms = HAL_GetTick();  // 現在時刻を保存する
         test_started = 1;               // 次回から開始時刻を上書きしない
-    }
+      }
 
-    /* 今回の電気角を使って、電流PIに入れる Id / Iq を計算 */
-    measure_current();
-    if (overcurrent_fault) {            // 既存の過電流保護が作動したら
+      /* 今回の電気角を使って、電流PIに入れる Id / Iq を計算 */
+      measure_current();
+      if (overcurrent_fault) {            // 既存の過電流保護が作動したら
         return;                         // PWMの更新まで進まない
-    }
+      }
 
-    uint32_t elapsed_ms = HAL_GetTick() - test_start_ms;  // 開始からの経過時間
-    if (elapsed_ms < 2000U) {                             // 最初の2秒は待機
+      uint32_t elapsed_ms = HAL_GetTick() - test_start_ms;  // 開始からの経過時間
+      if (elapsed_ms < 2000U) {                             // 最初の2秒は待機
         set_pwm(0.5f, 0.5f, 0.5f);             // 3相のデューティを等しくする
         return;
-    }
+      }
 
 
-    if (elapsed_ms >= 10000U || fabsf(current_u) > CURRENT_TEST_ABORT_A || fabsf(current_v) > CURRENT_TEST_ABORT_A || fabsf(current_w) > CURRENT_TEST_ABORT_A) {
+      if (elapsed_ms >= 10000U || fabsf(current_u) > CURRENT_TEST_ABORT_A || fabsf(current_v) > CURRENT_TEST_ABORT_A || fabsf(current_w) > CURRENT_TEST_ABORT_A) {
         motor[0].current_p_target = 0.0f;
         test_finished = 1;                                 // 試験終了を記録する
         motor_emergency_stop();                            // 3相のPWM出力を停止する
         return;
-    }
+      }
 
-    float speed_error = CURRENT_TEST_SPEED_RPM - motor[0].speed;
-    float iq_target = CURRENT_TEST_SPEED_KP * speed_error;
+      float speed_error = motor[0].now_speed_target - motor[0].speed;
+      float iq_target = motor[0].p * speed_error;
 
-    iq_target = fminf(CURRENT_TEST_IQ_MAX_A, fmaxf(-CURRENT_TEST_IQ_MAX_A, iq_target));
+      iq_target = fminf(CURRENT_TEST_IQ_MAX_A, fmaxf(-CURRENT_TEST_IQ_MAX_A, iq_target));
 
-    motor[0].current_d_target = 0.0f;
-    motor[0].current_p_target = iq_target;
+      motor[0].current_d_target = 0.0f;
+      motor[0].current_p_target = iq_target;
 
-    vd = test_current_pi(0.0f, motor[0].current_d, &id_integral);
-    vq = test_current_pi(iq_target, motor[0].current_p, &iq_integral);
+      vd = locate_pid(
+          motor[0].current_d, motor[0].current_d_target,
+          motor[0].current_d_pgain, motor[0].current_d_igain, 0.0f,
+          &motor[0].current_d_different_sum,
+          &motor[0].current_d_low_pass_different_sum,
+          &motor[0].current_d_last_difference,
+          cutoff, CURRENT_TEST_OUTPUT_MAX
+      );
+      vq = locate_pid(
+          motor[0].current_p, motor[0].current_p_target,
+          motor[0].current_p_pgain, motor[0].current_p_igain, 0.0f,
+          &motor[0].current_p_different_sum,
+          &motor[0].current_p_low_pass_different_sum,
+          &motor[0].current_p_last_difference,
+          cutoff, CURRENT_TEST_OUTPUT_MAX
+      );
 
-#else
-    /*速度制御*/
-    if (control_motor_mode[0] == 0) {
-
-      /*座標返還*/
-      vd = 0.0f;
-      vq = voltage;
-                              
-    }
-
-    /*電流制御*/
-    if (control_motor_mode[0] == 1){
-        vd = locate_pid(motor[0].current_d, motor[0].current_d_target, motor[0].current_d_pgain, motor[0].current_d_igain, motor[0].current_d_dgain, &motor[0].current_d_different_sum, &motor[0].current_d_low_pass_different_sum, &motor[0].current_d_last_difference, cutoff);
-        vq = locate_pid(motor[0].current_p, motor[0].current_p_target, motor[0].current_p_pgain, motor[0].current_p_igain, motor[0].current_p_dgain, &motor[0].current_p_different_sum, &motor[0].current_p_low_pass_different_sum, &motor[0].current_p_last_difference, cutoff);
-
-        if (vd > 0.3f)  vd = 0.3f;
-        if (vd < -0.3f) vd = -0.3f;
-        if (vq > 0.3f)  vq = 0.3f;
-        if (vq < -0.3f) vq = -0.3f;
-
-    }
-#endif
+      }
+      else{
+        /*座標返還*/
+        vd = 0.0f;
+        vq = voltage;                             
+      }
+    
     float va = vd * fast_cos(electrical_direction) - vq * fast_sin(electrical_direction);
     float vb = vd * fast_sin(electrical_direction) + vq * fast_cos(electrical_direction);
 
@@ -606,6 +577,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         
         if (overcurrent_fault || encoder_fault || driver_fault) {
           return;
+        }
+
+        if (control_motor_mode[0] == 1) {
+            measure_current();
+            return;
         }
 
         /*最初電流差でがたがたいうので速度目標を少しずつ上げることで回避したい*/
@@ -636,13 +612,18 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
           }
         }
         
+        if (control_motor_mode[0] == 2) {
+            update_openloop(0.0f);
+            return;
+        }
+
         float voltage_out = 0.0f;  // ← スコープを外に出す
 
         if (pid_mode[0] == 0) {
           voltage_out = locate_pid(motor[0].speed, motor[0].now_speed_target,
           motor[0].p, motor[0].i, motor[0].d,
           &motor[0].different_sum, &motor[0].low_pass_different_sum,
-          &motor[0].last_difference, cutoff);
+          &motor[0].last_difference, cutoff, 16384.0f);
         }
 
         if (pid_mode[0] == 1) {
@@ -665,16 +646,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         // locate_pidとspeed_pidの出力は-16384〜16384なので0〜0.3にスケール変換
         float voltage = voltage_out / 16384.0f * 0.3f;        
 
-        update_openloop(voltage);  // 角度を更新して、選ばれた方式でPWMを計算
-
-        #if !CURRENT_TEST_ENABLE   // 通常運転時は、従来どおりこの位置で電流を読む
-          measure_current();
-        #endif
+        update_openloop(voltage); // 角度を更新して、選ばれた方式でPWMを計算
+        measure_current();
     }
 }
 
 /*pid(速度型ではない方)*/
-float locate_pid(volatile float output, float target, float p, float i, float d, volatile float *different_sum, volatile float *low_pass_different_sum, volatile float *last_difference, int cutoff) {
+float locate_pid(volatile float output, float target, float p, float i, float d, volatile float *different_sum, volatile float *low_pass_different_sum, volatile float *last_difference, int cutoff, float output_limit) {
 
   float input;
   float difference;
@@ -682,6 +660,7 @@ float locate_pid(volatile float output, float target, float p, float i, float d,
 
   difference = target - output;
 
+  float previous_sum = *different_sum;
   *different_sum += difference * clock_time;
   if (*different_sum > 1000) {
     *different_sum = 1000;
@@ -704,14 +683,25 @@ float locate_pid(volatile float output, float target, float p, float i, float d,
 
   *last_difference = difference;
 
-  if (input >= 16384) {
-    input = 16384;
+  if (control_motor_mode[0] != 2) {
+    if (input >= 16384) {
+      input = 16384;
+    }
+    if (input <= -16384) {
+      input = -16384;
+    }
+    return input;
   }
-  if (input <= -16384) {
-    input = -16384;
+  else {
+    if ((input > output_limit && difference > 0.0f) || (input < -output_limit && difference < 0.0f)) {
+      *different_sum = previous_sum;
+      input = p * difference + i * (*different_sum) + d * (*low_pass_different_sum);
+    }
+
+    return fminf(output_limit, fmaxf(-output_limit, input));
   }
 
-  return input;
+  
 }
 
 /*pid速度型*/
@@ -778,23 +768,6 @@ void measure_current(void) {
 
   motor[0].current_d = id;
   motor[0].current_p = iq; 
-}
-
-void test_openloop_spin_veryslow(void)
-{
-    static float test_angle = 0.0f;
-    float test_vq = 0.15f;
-
-    test_angle += 0.0002f; 
-    if (test_angle > 2.0f*M_PI) test_angle -= 2.0f*M_PI;
-
-    float va = -test_vq * fast_sin(test_angle);
-    float vb =  test_vq * fast_cos(test_angle);
-    float u = va;
-    float v = -0.5f*va + 0.866f*vb;
-    float w = -0.5f*va - 0.866f*vb;
-    set_pwm(u+0.5f, v+0.5f, w+0.5f);
-
 }
 
 static uint32_t calib_simple_crc(uint32_t magic, float val)
@@ -906,40 +879,24 @@ int main(void)
   printf("step1: peripherals init done\r\n");
   for(int i=0;i<3;i++){
     motor[i].speed=0.0;
-    motor[i].speed_target=0.0;
+    motor[i].speed_target=200.0;
     if (pid_mode[i] == 0) {
       //n2830
       //motor[i].p=37.0;
       //motor[i].i=2.0;
       //motor[i].d=1.4;
       //n5065
-      if(control_motor_mode[i] == 0){
+      if(control_motor_mode[0] == 0){
         motor[i].p=35;
         motor[i].i=1.8;
         motor[i].d=1.4;
       }
-      if(control_motor_mode[i] == 1){
-        motor[i].current_d_pgain = 0.0;
-        motor[i].current_d_igain = 0.0;
-        motor[i].current_d_dgain = 0.0;
-        motor[i].current_p_pgain = 0.0;
-        motor[i].current_p_igain = 0.0;
-        motor[i].current_p_dgain = 0.0;
-      }
     }
     if (pid_mode[i] == 1) {
-      if(control_motor_mode[i] == 0){
+      if(control_motor_mode[0] == 0){
       motor[i].p=1.0;
       motor[i].i=0.05;
       motor[i].d=0.0;
-      }
-      if(control_motor_mode[i] == 1){
-        motor[i].current_d_pgain = 0.0;
-        motor[i].current_d_igain = 0.0;
-        motor[i].current_d_dgain = 0.0;
-        motor[i].current_p_pgain = 0.0;
-        motor[i].current_p_igain = 0.0;
-        motor[i].current_p_dgain = 0.0;
       }
     }
     motor[i].now_speed_target = 0.0;
@@ -960,6 +917,14 @@ int main(void)
     motor[i].current_p_low_pass_different_sum = 0.0;
     motor[i].current_p_last_difference = 0.0; 
   }  
+  if (control_motor_mode[0] == 2) {
+    motor[0].speed_target = 200.0f;
+    motor[0].p = 0.016f;
+    motor[0].current_d_pgain = 0.01f;
+    motor[0].current_d_igain = 0.10f;
+    motor[0].current_p_pgain = 0.01f;
+    motor[0].current_p_igain = 0.10f;
+  }
   cutoff = 8;
 
   printf("step2: motor struct init done\r\n");
@@ -1061,63 +1026,65 @@ int main(void)
   printf("step10: injected IT started\r\n");
 
   /* ゼロ点測定後、通電の直前に充電 */
-  if (!bootstrap_charge()) {
-    printf("BOOTSTRAP FAILED: PWM disabled\r\n");
-    fflush(stdout);
+  if (control_motor_mode[0] != 1) {
+    if (!bootstrap_charge()) {
+      printf("BOOTSTRAP FAILED: PWM disabled\r\n");
+      fflush(stdout);
 
-    while (1) {
-        HAL_Delay(100);
-    }
-  }
-
-  /* 通常PWM開始 */
-  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
-    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
-    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK ||
-    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3) != HAL_OK) {
-
-    motor_emergency_stop();
-    printf("PWM START FAILED\r\n");
-
-    while (1) {
-        HAL_Delay(100);
-    }
-  }
-
-  printf("bootstrap charged, PWM started\r\n");
-
-  //FCO処理
-  // float loaded_zero_offset;
-  // if (calib_load(&loaded_zero_offset)) {
-  //     zero_offset_rad = loaded_zero_offset;
-  //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
-  //            (int)(zero_offset_rad * 1000));
-  // } else {
-      set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
-      HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
-      zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
-
-      if (calib_save(zero_offset_rad) == HAL_OK) {
-          printf("step11: FCO lock done, saved to flash, zero_offset_rad=%d\r\n",
-                 (int)(zero_offset_rad * 1000));
-      } else {
-          printf("step11: FCO lock done, FLASH SAVE FAILED, zero_offset_rad=%d\r\n",
-                 (int)(zero_offset_rad * 1000));
+      while (1) {
+          HAL_Delay(100);
       }
+    }
 
-      /* ロックが実際に効いているかの確認は、ロックした場合のみ実施 */
-      uint16_t angle_before = as5047p_read_angle();
-      HAL_Delay(200);
-      uint16_t angle_after = as5047p_read_angle();
-      int16_t diff = (int16_t)angle_after - (int16_t)angle_before;
-      if (diff > 8192) diff -= 16384;
-      if (diff < -8192) diff += 16384;
-      if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
-        printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
+    /* 通常PWM開始 */
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
+      HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK ||
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
+      HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2) != HAL_OK ||
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK ||
+      HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3) != HAL_OK) {
+
+      motor_emergency_stop();
+      printf("PWM START FAILED\r\n");
+
+      while (1) {
+          HAL_Delay(100);
       }
-  // }
+    }
+
+    printf("bootstrap charged, PWM started\r\n");
+
+    //FCO処理
+    // float loaded_zero_offset;
+    // if (calib_load(&loaded_zero_offset)) {
+    //     zero_offset_rad = loaded_zero_offset;
+    //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
+    //            (int)(zero_offset_rad * 1000));
+    // } else {
+        set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
+        HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
+        zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
+
+        if (calib_save(zero_offset_rad) == HAL_OK) {
+            printf("step11: FCO lock done, saved to flash, zero_offset_rad=%d\r\n",
+                   (int)(zero_offset_rad * 1000));
+        } else {
+            printf("step11: FCO lock done, FLASH SAVE FAILED, zero_offset_rad=%d\r\n",
+                   (int)(zero_offset_rad * 1000));
+        }
+
+        /* ロックが実際に効いているかの確認は、ロックした場合のみ実施 */
+        uint16_t angle_before = as5047p_read_angle();
+        HAL_Delay(200);
+        uint16_t angle_after = as5047p_read_angle();
+        int16_t diff = (int16_t)angle_after - (int16_t)angle_before;
+        if (diff > 8192) diff -= 16384;
+        if (diff < -8192) diff += 16384;
+        if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
+          printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
+        }
+    // }
+  }
   // TIM2でコントロールループ開始（割り込み）
   HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
@@ -1146,12 +1113,12 @@ int main(void)
     //         printf("Device RESET detected! cleared.\r\n");
     //     }
     // }
-    #if CURRENT_TEST_ENABLE
-    printf("CURRENT TEST Id=%d mA Iq=%d mA target=%d mA\r\n",
-           (int)(motor[0].current_d * 1000.0f),
-           (int)(motor[0].current_p * 1000.0f),
-           (int)(motor[0].current_p_target * 1000.0f));
-    #endif
+    if (control_motor_mode[0] == 2) {
+      printf("CURRENT TEST Id=%d mA Iq=%d mA target=%d mA\r\n",
+      (int)(motor[0].current_d * 1000.0f),
+      (int)(motor[0].current_p * 1000.0f),
+      (int)(motor[0].current_p_target * 1000.0f));
+    }
 
     /* 異常解除はせず、読み取りと停止だけ行う */
     if (!driver_fault) {
