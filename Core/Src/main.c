@@ -95,6 +95,7 @@ typedef struct __attribute__((packed)) {
 
 #define CAN_MOTOR_CMD_BASE_ID  0x302u
 #define DRIVE_MAX_RPM  5000.0f
+#define DRIVE_CAN_TIMEOUT_MS  300U
 #define CAN_MOTOR_NUM          3u
 /* USER CODE END PD */
 
@@ -135,6 +136,11 @@ volatile int pid_mode[3] = {0, 0, 0};             //0ならlocate_pid 1ならspe
 volatile int control_motor_mode[3] = {0, 0, 0};   //モーターの制御モード
 
 volatile uint32_t rx_ok_count = 0;
+
+/* Nonzero startup speed_target selects the local bench test. */
+enum { DRIVE_LOCAL, DRIVE_CAN_WAIT, DRIVE_CAN_ARM, DRIVE_CAN_RUN, DRIVE_CAN_STOP };
+static volatile uint8_t drive_state;
+static volatile uint32_t drive_last_rx_ms;
 static volatile uint32_t tim2_cnt = 0;
 
 volatile uint8_t encoder_fault = 0;
@@ -286,10 +292,21 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     }
 
     /* 0x301/0x302/0x303どれで来ても、motor[0]で固定している。使用するロボットでは別々の基盤にcanで送信して動かすため */
+    uint32_t now = HAL_GetTick();
+    uint8_t state = drive_state;
+    if (state == DRIVE_LOCAL || state == DRIVE_CAN_STOP ||
+        (state != DRIVE_CAN_WAIT && now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS)) {
+        return;
+    }
+
     motor[0].speed_target       = cmd.speed_target;
     pid_mode[0]                 = cmd.pid_mode ? 1 : 0;
     control_motor_mode[0]       = cmd.control_motor_mode ? 1 : 0;
 
+    drive_last_rx_ms = now;
+    if (state == DRIVE_CAN_WAIT) {
+        drive_state = DRIVE_CAN_ARM;
+    }
     rx_ok_count++;
 }
 
@@ -470,9 +487,33 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim->Instance == TIM2)
     {
         tim2_cnt++;
+
+        uint32_t mask = __get_PRIMASK();
+        __disable_irq();
+        uint8_t state = drive_state;
+        uint8_t timed_out = (state == DRIVE_CAN_ARM || state == DRIVE_CAN_RUN) &&
+            HAL_GetTick() - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS;
+        if (timed_out) {
+            drive_state = DRIVE_CAN_STOP;
+        }
+        __set_PRIMASK(mask);
+
+        if (timed_out) {
+            motor_emergency_stop();
+            motor[0].speed_target = 0.0f;
+            motor[0].now_speed_target = 0.0f;
+            /* DRIVE_CAN_STOP stays latched until reset, which reinitializes the PID. */
+        }
+        if (timed_out || state == DRIVE_CAN_WAIT || state == DRIVE_CAN_STOP) {
+            return;
+        }
         
         if (overcurrent_fault || encoder_fault) {
           return;
+        }
+        if (state == DRIVE_CAN_ARM) {
+            __HAL_TIM_MOE_ENABLE(&htim1);
+            drive_state = DRIVE_CAN_RUN;
         }
 
         /*最初電流差でがたがたいうので速度目標を少しずつ上げることで回避したい*/
@@ -981,6 +1022,11 @@ int main(void)
   HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 0, 0);
   HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
 
+  set_pwm(0.5f, 0.5f, 0.5f);
+  if (motor[0].speed_target == 0.0f) {
+    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+    drive_state = DRIVE_CAN_WAIT;
+  }
   HAL_TIM_Base_Start_IT(&htim2);
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("boot\r\n");
@@ -1037,6 +1083,8 @@ int main(void)
     HAL_FDCAN_Start(&hfdcan1);
     }
     HAL_FDCAN_GetErrorCounters(&hfdcan1, &ecounters);
+    printf("drive_state=%u ramp_rpm=%ld\r\n",
+           (unsigned int)drive_state, (long)motor[0].now_speed_target);
     printf("rx_ok=%lu BusOff=%d ErrPassive=%d TEC=%lu REC=%lu target=%d tim2_cnt=%d pid_mode=%d ctrl_mode=%d speed=%d angle=%u OC_FAULT=%d I_U=%d I_V=%d I_W=%d\r\n",
     rx_ok_count, pstatus.BusOff, pstatus.ErrorPassive,
     (unsigned long)ecounters.TxErrorCnt, (unsigned long)ecounters.RxErrorCnt,
