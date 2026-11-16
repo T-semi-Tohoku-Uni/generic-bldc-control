@@ -1024,42 +1024,40 @@ int main(void)
     //     printf("step11: calibration loaded from flash, zero_offset_rad=%d\r\n",
     //            (int)(zero_offset_rad * 1000));
     // } else {
-        set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
-        HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
-        zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
+    set_pwm(0.58f, 0.46f, 0.46f);  // U相に電圧をかけてモータを0度に強制ロック
+    HAL_Delay(1000);                   // 1秒待って完全に静止させる、その位置を0点として記憶
+    zero_offset_rad = ((float)as5047p_read_angle() / 16384.0f) * 2.0f * M_PI;
 
-        if (calib_save(zero_offset_rad) == HAL_OK) {
-            printf("step11: FCO lock done, saved to flash, zero_offset_rad=%d\r\n",
-                   (int)(zero_offset_rad * 1000));
-        } else {
-            printf("step11: FCO lock done, FLASH SAVE FAILED, zero_offset_rad=%d\r\n",
-                   (int)(zero_offset_rad * 1000));
-        }
+    if (calib_save(zero_offset_rad) == HAL_OK) {
+        printf("step11: FCO lock done, saved to flash, zero_offset_rad=%d\r\n", (int)(zero_offset_rad * 1000));
+    } else {
+         printf("step11: FCO lock done, FLASH SAVE FAILED, zero_offset_rad=%d\r\n", (int)(zero_offset_rad * 1000));
+    }
 
-        /* ロックが実際に効いているかの確認は、ロックした場合のみ実施 */
-        uint16_t angle_before = as5047p_read_angle();
-        HAL_Delay(200);
-        uint16_t angle_after = as5047p_read_angle();
-        int16_t diff = (int16_t)angle_after - (int16_t)angle_before;
-        if (diff > 8192) diff -= 16384;
-        if (diff < -8192) diff += 16384;
-        if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
-          printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
-        }
+    /* ロックが実際に効いているかの確認は、ロックした場合のみ実施 */
+    uint16_t angle_before = as5047p_read_angle();
+    HAL_Delay(200);
+    uint16_t angle_after = as5047p_read_angle();
+    int16_t diff = (int16_t)angle_after - (int16_t)angle_before;
+    if (diff > 8192) diff -= 16384;
+    if (diff < -8192) diff += 16384;
+    if (abs(diff) > 50) { // ロック後も動いている＝ロック失敗
+      printf("WARNING: FCO lock unstable! diff=%d\r\n", diff);
+    }
     // }
-  }
-  // TIM2でコントロールループ開始（割り込み）
-  HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(TIM2_IRQn);
+    }
+    // TIM2でコントロールループ開始（割り込み）
+    HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
 
-  HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 0, 0);
-  HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
+    HAL_NVIC_SetPriority(FDCAN1_IT0_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
 
-  HAL_TIM_Base_Start_IT(&htim2);
-  setvbuf(stdout, NULL, _IONBF, 0);
-  printf("boot\r\n");
-  printf("boot: control loop started\r\n");
-  //uint16_t prev_angle_raw = as5047p_read_angle();
+    HAL_TIM_Base_Start_IT(&htim2);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("boot\r\n");
+    printf("boot: control loop started\r\n");
+    //uint16_t prev_angle_raw = as5047p_read_angle();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1077,10 +1075,7 @@ int main(void)
     //     }
     // }
     if (control_motor_mode[0] == 2) {
-      printf("CURRENT TEST Id=%d mA Iq=%d mA target=%d mA\r\n",
-      (int)(motor[0].current_d * 1000.0f),
-      (int)(motor[0].current_p * 1000.0f),
-      (int)(motor[0].current_p_target * 1000.0f));
+      printf("CURRENT TEST Id=%d mA Iq=%d mA target=%d mA\r\n", (int)(motor[0].current_d * 1000.0f), (int)(motor[0].current_p * 1000.0f), (int)(motor[0].current_p_target * 1000.0f));
     }
 
     /* 異常解除はせず、読み取りと停止だけ行う */
@@ -1093,9 +1088,7 @@ int main(void)
         driver_fault = 1;
         motor_emergency_stop();
 
-        printf("DRIVER STOP: I2C=%d STATUS=0x%02X\r\n",
-               (int)result,
-               (unsigned int)status);
+        printf("DRIVER STOP: I2C=%d STATUS=0x%02X\r\n", (int)result, (unsigned int)status);
         fflush(stdout);
       }
     }
@@ -1132,14 +1125,7 @@ int main(void)
     HAL_FDCAN_Start(&hfdcan1);
     }
     HAL_FDCAN_GetErrorCounters(&hfdcan1, &ecounters);
-    printf("rx_ok=%lu BusOff=%d ErrPassive=%d TEC=%lu REC=%lu target=%d tim2_cnt=%d pid_mode=%d ctrl_mode=%d speed=%d angle=%u OC_FAULT=%d I_U=%d I_V=%d I_W=%d\r\n",
-    rx_ok_count, pstatus.BusOff, pstatus.ErrorPassive,
-    (unsigned long)ecounters.TxErrorCnt, (unsigned long)ecounters.RxErrorCnt,
-    (int)motor[0].speed_target, tim2_cnt,
-    pid_mode[0], control_motor_mode[0],
-    (int)motor[0].speed, angle_raw,
-    overcurrent_fault,
-    (int)(current_u*1000), (int)(current_v*1000), (int)(current_w*1000));
+    printf("rx_ok=%lu BusOff=%d ErrPassive=%d TEC=%lu REC=%lu target=%d tim2_cnt=%d pid_mode=%d ctrl_mode=%d speed=%d angle=%u OC_FAULT=%d I_U=%d I_V=%d I_W=%d\r\n", rx_ok_count, pstatus.BusOff, pstatus.ErrorPassive, (unsigned long)ecounters.TxErrorCnt, (unsigned long)ecounters.RxErrorCnt, (int)motor[0].speed_target, tim2_cnt, pid_mode[0], control_motor_mode[0], (int)motor[0].speed, angle_raw, overcurrent_fault, (int)(current_u*1000), (int)(current_v*1000), (int)(current_w*1000));
     printf("encoder_fault=%d encoder_fault_score=%d", encoder_fault, encoder_fault_score);
   }
   /* USER CODE END 3 */
