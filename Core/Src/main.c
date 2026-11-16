@@ -94,6 +94,7 @@ typedef struct __attribute__((packed)) {
 #define ENCODER_FAULT_SCORE_MAX   30    // スコアの上限
 
 #define CAN_MOTOR_CMD_BASE_ID  0x302u
+#define DRIVE_MAX_RPM  5000.0f
 #define CAN_MOTOR_NUM          3u
 /* USER CODE END PD */
 
@@ -255,24 +256,34 @@ static void FDCAN1_ConfigFilterAndStart(void)
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
+    if (hfdcan->Instance != FDCAN1) return;
     if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0) return;
 
     FDCAN_RxHeaderTypeDef RxHeader;
-    uint8_t RxData[8];
+    uint8_t RxData[64];
 
     if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &RxHeader, RxData) != HAL_OK)
     {
         return;
     }
 
-    if (RxHeader.IdType != FDCAN_STANDARD_ID) return;
-    if (RxHeader.DataLength != FDCAN_DLC_BYTES_8) return;
+    if (RxHeader.IdType != FDCAN_STANDARD_ID ||
+        RxHeader.Identifier != CAN_MOTOR_CMD_BASE_ID ||
+        RxHeader.RxFrameType != FDCAN_DATA_FRAME ||
+        RxHeader.FDFormat != FDCAN_CLASSIC_CAN ||
+        RxHeader.BitRateSwitch != FDCAN_BRS_OFF ||
+        RxHeader.DataLength != FDCAN_DLC_BYTES_8) {
+        return;
+    }
     can_motor_cmd_t cmd;
     memcpy(&cmd, RxData, sizeof(cmd));
 
-    /* 範囲外の値でモーターが暴走しないよう軽くクリップ */
-    if (cmd.speed_target > 5000.0f)  cmd.speed_target = 5000.0f;
-    if (cmd.speed_target < -5000.0f) cmd.speed_target = -5000.0f;
+    if (!isfinite(cmd.speed_target) ||
+        fabsf(cmd.speed_target) > DRIVE_MAX_RPM ||
+        cmd.pid_mode > 1U ||
+        cmd.control_motor_mode != 0U) {
+        return;
+    }
 
     /* 0x301/0x302/0x303どれで来ても、motor[0]で固定している。使用するロボットでは別々の基盤にcanで送信して動かすため */
     motor[0].speed_target       = cmd.speed_target;
