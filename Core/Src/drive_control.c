@@ -62,16 +62,28 @@ volatile float motor_current_p_low_pass_different_sum;
 volatile float motor_current_p_last_difference;
 volatile float motor_current_d_pgain;
 volatile float motor_current_d_igain;
-volatile float motor_current_d_dgain;
 volatile float motor_current_p_pgain;
 volatile float motor_current_p_igain;
-volatile float motor_current_p_dgain;
 
 static inline float fast_sin(float x) { return sinf(x); }
 static inline float fast_cos(float x) { return cosf(x); }
 
 volatile int pid_mode = 0;             //0ならlocate_pid 1ならspeed_pid
-volatile int control_motor_mode = 0;   //モーターの制御モード
+
+/* 制御方式 */
+typedef enum {
+    CONTROL_VOLTAGE = 0,
+    CONTROL_CURRENT_PI = 1
+} DriveControlMode;
+
+/* CAN指令を待つか、コードで指定した目標で単体試験するか */
+typedef enum {
+    DRIVE_COMMAND_CAN,
+    DRIVE_COMMAND_LOCAL
+} DriveCommandSource;
+
+static const DriveCommandSource drive_command_source = DRIVE_COMMAND_LOCAL;
+static const DriveControlMode control_motor_mode = CONTROL_CURRENT_PI;
 
 volatile uint32_t rx_ok_count = 0;
 
@@ -110,6 +122,34 @@ static float zero_offset_rad = 0.0f;  //初期位置のずれを確認する
 
 uint16_t angle_raw;
 
+static volatile uint32_t adc_done_count;
+static volatile uint32_t adc_observed_u;
+static volatile uint32_t adc_observed_w;
+static volatile uint32_t adc_u_min = 4095U;
+static volatile uint32_t adc_u_max = 0U;
+static volatile uint32_t adc_w_min = 4095U;
+static volatile uint32_t adc_w_max = 0U;
+
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance != ADC1) {
+        return;
+    }
+
+    adc_observed_u = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+    adc_observed_w = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_2);
+    adc_done_count++;
+
+    // ADCコールバック内で、adc_observed_u / adc_observed_w を更新した直後
+    uint32_t u = adc_observed_u;
+    uint32_t w = adc_observed_w;
+
+    if (u < adc_u_min) adc_u_min = u;
+    if (u > adc_u_max) adc_u_max = u;
+    if (w < adc_w_min) adc_w_min = w;
+    if (w > adc_w_max) adc_w_max = w;
+}
+
 static void set_pwm(float ua, float ub, float uc)
 {
     /*各相の電圧指令値は0から1であるので不正な値を消去 ua・ub・uc は、U・V・Wそれぞれの 0〜1に正規化した指令*/
@@ -147,13 +187,14 @@ void drive_accept_can_command(float speed_target, uint8_t requested_pid_mode, ui
     uint32_t now = HAL_GetTick();
     uint8_t state = drive_state;
 
-    if (state == DRIVE_LOCAL || state == DRIVE_CAN_STOP || (state != DRIVE_CAN_WAIT && now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS)) {
+    if (requested_control_mode != (uint8_t)control_motor_mode ||
+        state == DRIVE_LOCAL || state == DRIVE_CAN_STOP ||
+        (state != DRIVE_CAN_WAIT && now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS)) {
         return;
     }
 
     motor_speed_target = speed_target;
     pid_mode = requested_pid_mode ? 1 : 0;
-    control_motor_mode = requested_control_mode ? 1 : 0;
 
     /* 前回の値を確認し、次この関数が呼ばれた時のnowと比較することによってtimeoutでないか確認 */
     drive_last_rx_ms = now;
@@ -237,7 +278,12 @@ static void update_openloop(float voltage)
         motor_emergency_stop();
     }
 
-    if (enc_bad || encoder_fault) return;
+    if (enc_bad || encoder_fault) {
+      if (control_motor_mode == CONTROL_CURRENT_PI) {
+        measure_current();
+      }
+      return;
+    }
 
     /* 最初の正常な角度を、速度計算の基準にする */
     if (!speed_initialized) {
@@ -271,8 +317,8 @@ static void update_openloop(float voltage)
 
     float vd;
     float vq;
-    /*速度制御*/
-    if (control_motor_mode == 0) {
+    /*電圧制御*/
+    if (control_motor_mode == CONTROL_VOLTAGE) {
 
       /* 速度PIDの出力をq軸の電圧指令にし、後段で三相へ座標変換する。 */
       vd = 0.0f;      // d軸は、モーターの中心からローターの磁石が向いている方向へ伸びる半径方向 電圧制御では0にしているが電流制御ではここを変更することによって効率を上げることができる
@@ -281,14 +327,37 @@ static void update_openloop(float voltage)
     }
 
     /*電流制御*/
-    if (control_motor_mode == 1){
-        vd = locate_pid( motor_current_d, motor_current_d_target, motor_current_d_pgain, motor_current_d_igain, motor_current_d_dgain, &motor_current_d_different_sum, &motor_current_d_low_pass_different_sum, &motor_current_d_last_difference, cutoff);
-        vq = locate_pid( motor_current_p, motor_current_p_target, motor_current_p_pgain, motor_current_p_igain, motor_current_p_dgain, &motor_current_p_different_sum, &motor_current_p_low_pass_different_sum, &motor_current_p_last_difference, cutoff);
+    if (control_motor_mode == CONTROL_CURRENT_PI){
+        const float voltage_limit = 0.10f; //単体試験用の正規化電圧上限
 
-        if (vd > 0.3f)  vd = 0.3f;
-        if (vd < -0.3f) vd = -0.3f;
-        if (vq > 0.3f)  vq = 0.3f;
-        if (vq < -0.3f) vq = -0.3f;
+        measure_current();
+        if (overcurrent_fault) {
+          return;
+        }
+
+        const float id_sum_before = motor_current_d_different_sum;
+        const float iq_sum_before = motor_current_p_different_sum;
+
+        vd = locate_pid( motor_current_d, motor_current_d_target, motor_current_d_pgain, motor_current_d_igain, 0.0f, &motor_current_d_different_sum, &motor_current_d_low_pass_different_sum, &motor_current_d_last_difference, cutoff);
+        vq = locate_pid( motor_current_p, motor_current_p_target, motor_current_p_pgain, motor_current_p_igain, 0.0f, &motor_current_p_different_sum, &motor_current_p_low_pass_different_sum, &motor_current_p_last_difference, cutoff);
+
+        /* 電圧が上限に達しているとき、PIの積分がさらに溜まりすぎるのを防ぐ処理 pidが正しい方向にいっているか確認 */
+        const float voltage_sq = vd * vd + vq * vq;
+
+        if (voltage_sq > voltage_limit * voltage_limit) {
+          const float delta_vd_i = motor_current_d_igain * (motor_current_d_different_sum - id_sum_before);
+          const float delta_vq_i = motor_current_p_igain * (motor_current_p_different_sum - iq_sum_before);
+
+          if (vd * delta_vd_i + vq * delta_vq_i > 0.0f) {
+            motor_current_d_different_sum = id_sum_before;
+            motor_current_p_different_sum = iq_sum_before;
+          }
+
+          /* vd と vq を同じ倍率で縮めて、合成した電圧指令を上限ちょうどに収めている */
+          const float scale = voltage_limit / sqrtf(voltage_sq);
+          vd *= scale;
+          vq *= scale;
+        }
     }
 
     /* ローターと一緒に回るd軸・q軸をモーターの固定側にあるα軸・β軸に変換 α軸がU相の向きで、β軸はそこから電気角で90°*/
@@ -338,6 +407,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         if (state == DRIVE_CAN_ARM) {
             __HAL_TIM_MOE_ENABLE(&htim1);
             drive_state = DRIVE_CAN_RUN;
+        }
+
+        if (control_motor_mode == CONTROL_CURRENT_PI) {
+          update_openloop(0.0f);
+          return;
         }
 
         /*最初電流差でがたがたいうので速度目標を少しずつ上げることで回避したい*/
@@ -392,7 +466,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 static void initialize_motor_variables(void)
 {
   motor_speed = 0.0;
-  motor_speed_target = 200.0;
+  motor_speed_target = 0.0;
   if (pid_mode == 0) {
     /* N2830を使用していたときの速度PID設定（参考）
      * motor_p = 37.0;
@@ -400,33 +474,17 @@ static void initialize_motor_variables(void)
      * motor_d = 1.4;
      */
     /* 現在のN5065用速度PID設定。 */
-    if(control_motor_mode == 0){
+    if(control_motor_mode == CONTROL_VOLTAGE){
       motor_p=35;
       motor_i=1.8;
       motor_d=1.4;
     }
-    if(control_motor_mode == 1){
-      motor_current_d_pgain = 0.0;
-      motor_current_d_igain = 0.0;
-      motor_current_d_dgain = 0.0;
-      motor_current_p_pgain = 0.0;
-      motor_current_p_igain = 0.0;
-      motor_current_p_dgain = 0.0;
-    }
   }
   if (pid_mode == 1) {
-    if(control_motor_mode == 0){
+    if(control_motor_mode == CONTROL_VOLTAGE){
       motor_p=1.0;
       motor_i=0.05;
       motor_d=0.0;
-    }
-    if(control_motor_mode == 1){
-      motor_current_d_pgain = 0.0;
-      motor_current_d_igain = 0.0;
-      motor_current_d_dgain = 0.0;
-      motor_current_p_pgain = 0.0;
-      motor_current_p_igain = 0.0;
-      motor_current_p_dgain = 0.0;
     }
   }
   motor_now_speed_target = 0.0;
@@ -439,13 +497,19 @@ static void initialize_motor_variables(void)
   motor_current_d = 0.0;
   motor_current_p = 0.0;
   motor_current_d_target = 0.0;
-  motor_current_p_target = 0.0;
+  motor_current_p_target = 2.0f;  // Iqの初期目標 [A]
   motor_current_d_different_sum = 0.0;
   motor_current_d_low_pass_different_sum = 0.0;
   motor_current_d_last_difference = 0.0;      //currentは電流といういみ　現在ではない
   motor_current_p_different_sum = 0.0;
   motor_current_p_low_pass_different_sum = 0.0;
   motor_current_p_last_difference = 0.0;
+  if (control_motor_mode == CONTROL_CURRENT_PI) {
+    motor_current_d_pgain = 0.01f;
+    motor_current_d_igain = 0.10f;
+    motor_current_p_pgain = 0.01f;
+    motor_current_p_igain = 0.10f;
+  }
   cutoff = 8;
 }
 
@@ -490,8 +554,8 @@ static void start_current_measurement(void)
   printf("step7: OPAMP started\r\n");
 
   // 設定済みのInjected変換を割り込みなしで開始し、ゼロ点を測る。
-  HAL_ADCEx_InjectedStart(&hadc1);
   HAL_ADCEx_InjectedStart(&hadc2);
+  HAL_ADCEx_InjectedStart(&hadc1);
 
   printf("step8: injected ADC started\r\n");
 
@@ -525,8 +589,8 @@ static void start_current_measurement(void)
   HAL_ADCEx_InjectedStop(&hadc2);
 
   // ゼロ点を求めた後、変換完了割り込み付きで再開する。
-  HAL_ADCEx_InjectedStart_IT(&hadc1);
   HAL_ADCEx_InjectedStart_IT(&hadc2);
+  HAL_ADCEx_InjectedStart_IT(&hadc1);
 
   printf("step10: injected IT started\r\n");
 }
@@ -589,6 +653,10 @@ static void align_motor_encoder(void)
 void drive_init(void)
 {
   printf("step1: peripherals init done\r\n");
+
+  if (drive_command_source == DRIVE_COMMAND_CAN && control_motor_mode != CONTROL_VOLTAGE) {
+    drive_startup_failed("CONFIG ERROR: CAN requires voltage control");
+  }
   initialize_motor_variables();
 
   printf("step2: motor variables init done\r\n");
@@ -640,12 +708,15 @@ void drive_init(void)
   HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
 
   set_pwm(0.5f, 0.5f, 0.5f);
-  /* 速度目標が0の場合 */
-  if (motor_speed_target == 0.0f) {
-    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);   // TIM1の MOE（Main Output Enable）をクリアして、PWM出力そのものを無効に
-    drive_state = DRIVE_CAN_WAIT;                    // can待ち状態に
+
+  if (drive_command_source == DRIVE_COMMAND_LOCAL) {
+    drive_state = DRIVE_LOCAL;
+  } else {
+    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+    drive_state = DRIVE_CAN_WAIT;
   }
-  HAL_TIM_Base_Start_IT(&htim2);                // 平ドラのモーター制御を200 µsごとに制御しているtim2を起動 HAL_TIM_PeriodElapsedCallbackが起動される
+
+  HAL_TIM_Base_Start_IT(&htim2);    // 平ドラのモーター制御を200 µsごとに制御しているtim2を起動 HAL_TIM_PeriodElapsedCallbackが起動される
 
   /* どういうことか */
   // HAL_TIM_Base_Start_IT(&htim2)       ← 起動時に1回だけ呼ぶ
@@ -698,7 +769,36 @@ void drive_report(void)
   fflush(stdout);
   HAL_Delay(200);
   poll_driver_faults();
+  printf("ADC done=%lu U_raw=%lu W_raw=%lu\r\n",
+       (unsigned long)adc_done_count,
+       (unsigned long)adc_observed_u,
+       (unsigned long)adc_observed_w);
+  printf("DQ speed=%d rpm Id=%ld mA Iq=%ld mA\r\n",
+       (int)motor_speed,
+       (long)(motor_current_d * 1000.0f),
+       (long)(motor_current_p * 1000.0f));
+  uint32_t irq_mask = __get_PRIMASK();
+__disable_irq();
 
+uint32_t u_min = adc_u_min;
+uint32_t u_max = adc_u_max;
+uint32_t w_min = adc_w_min;
+uint32_t w_max = adc_w_max;
+
+adc_u_min = 4095U;
+adc_u_max = 0U;
+adc_w_min = 4095U;
+adc_w_max = 0U;
+
+__set_PRIMASK(irq_mask);
+
+if (u_max >= u_min && w_max >= w_min) {
+    printf("ADC range U=%lu..%lu (span=%lu) W=%lu..%lu (span=%lu)\r\n",
+           (unsigned long)u_min, (unsigned long)u_max,
+           (unsigned long)(u_max - u_min),
+           (unsigned long)w_min, (unsigned long)w_max,
+           (unsigned long)(w_max - w_min));
+}
   /* CAN受信状況を表示 */
   FDCAN_ProtocolStatusTypeDef pstatus;
   FDCAN_ErrorCountersTypeDef  ecounters;
@@ -709,6 +809,6 @@ void drive_report(void)
   }
   HAL_FDCAN_GetErrorCounters(&hfdcan1, &ecounters);
   printf("drive_state=%u ramp_rpm=%ld\r\n", (unsigned int)drive_state, (long)motor_now_speed_target);
-  printf("rx_ok=%lu BusOff=%lu ErrPassive=%lu TEC=%lu REC=%lu target=%d " "tim2_cnt=%lu pid_mode=%d ctrl_mode=%d speed=%d angle=%u OC_FAULT=%d " "I_U=%d I_V=%d I_W=%d\r\n", rx_ok_count, (unsigned long)pstatus.BusOff, (unsigned long)pstatus.ErrorPassive, (unsigned long)ecounters.TxErrorCnt, (unsigned long)ecounters.RxErrorCnt, (int)motor_speed_target, (unsigned long)tim2_cnt, pid_mode, control_motor_mode, (int)motor_speed, angle_raw, overcurrent_fault, (int)(current_u*1000), (int)(current_v*1000), (int)(current_w*1000));
+  printf("rx_ok=%lu BusOff=%lu ErrPassive=%lu TEC=%lu REC=%lu target=%d " "tim2_cnt=%lu pid_mode=%d ctrl_mode=%d speed=%d angle=%u OC_FAULT=%d " "I_U=%d I_V=%d I_W=%d\r\n", rx_ok_count, (unsigned long)pstatus.BusOff, (unsigned long)pstatus.ErrorPassive, (unsigned long)ecounters.TxErrorCnt, (unsigned long)ecounters.RxErrorCnt, (int)motor_speed_target, (unsigned long)tim2_cnt, pid_mode, (int)control_motor_mode, (int)motor_speed, angle_raw, overcurrent_fault, (int)(current_u*1000), (int)(current_v*1000), (int)(current_w*1000));
   printf("encoder_fault=%d encoder_fault_score=%d", encoder_fault, encoder_fault_score);
 }
