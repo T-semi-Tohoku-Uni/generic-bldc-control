@@ -505,10 +505,10 @@ static void initialize_motor_variables(void)
   motor_current_p_low_pass_different_sum = 0.0;
   motor_current_p_last_difference = 0.0;
   if (control_motor_mode == CONTROL_CURRENT_PI) {
-    motor_current_d_pgain = 0.01f;
+    motor_current_d_pgain = 0.020f;
     motor_current_d_igain = 0.10f;
-    motor_current_p_pgain = 0.01f;
-    motor_current_p_igain = 0.10f;
+    motor_current_p_pgain = 0.015f;
+    motor_current_p_igain = 2.5f;
   }
   cutoff = 8;
 }
@@ -654,6 +654,7 @@ void drive_init(void)
 {
   printf("step1: peripherals init done\r\n");
 
+  
   if (drive_command_source == DRIVE_COMMAND_CAN && control_motor_mode != CONTROL_VOLTAGE) {
     drive_startup_failed("CONFIG ERROR: CAN requires voltage control");
   }
