@@ -651,6 +651,7 @@ static void align_motor_encoder(void)
 
     motor_emergency_stop();
     printf("ALIGN FAILED: stopped\r\n");
+    as5047p_report_stopped_fault();
     fflush(stdout);
 
     while (1) {
@@ -696,6 +697,10 @@ void drive_init(void)
   HAL_Delay(100);
 
   printf("step3: encoder + WAKE done\r\n");
+
+  if (!as5047p_startup_check()) {
+    drive_startup_failed("ENC START FAILED: PWM disabled");
+  }
 
   printf("board mode: %s\r\n", motor_board_mode == DRIVE_BOARD_V3 ? "V3" : "LEGACY");
 
@@ -782,6 +787,12 @@ static void poll_driver_faults(void)
 
 void drive_report(void)
 {
+  static bool encoder_fault_reported = false;
+  if (encoder_fault && !encoder_fault_reported) {
+    // TIM2は異常を保持した状態で、以降エンコーダーを読まない。
+    encoder_fault_reported = true;
+    as5047p_report_stopped_fault();
+  }
   poll_driver_faults();
 
   fflush(stdout);
