@@ -12,7 +12,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 typedef struct __attribute__((packed)) {
     float   speed_target;               /* byte0-3 */
     uint8_t pid_mode;                   /* byte4: 0=locate_pid, 1=speed_pid 1ではなぜか上手くいかないので0を用いて*/
-    uint8_t control_motor_mode;         /* byte5: 0=電圧制御, 1=電流制御 基本的に0を用いて*/
+    uint8_t control_motor_mode;         /* byte5: 0=電圧制御, 1=電流PI制御*/
     uint8_t reserved[2];                /* byte6-7 */
 } can_motor_cmd_t;
 
@@ -89,8 +89,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     memcpy(&cmd, RxData, sizeof(cmd));  // 受信したバイト列を cmd にコピー 受信した8バイトを指令フィールドとして参照する。
 
     /* 受信値が正しいものであるかを確認 isfinite() で NaN や無限大を弾く max_speed以下か */
-    if (!isfinite(cmd.speed_target) || fabsf(cmd.speed_target) > DRIVE_MAX_RPM || cmd.pid_mode > 1U || cmd.control_motor_mode != 0U) {
-        return;
+    if (!isfinite(cmd.speed_target) || fabsf(cmd.speed_target) > DRIVE_MAX_RPM || cmd.pid_mode > 1U || cmd.control_motor_mode > 1U) {
+      return;
     }
 
     /* 各平ドラは自基板のIDで届いた指令を、接続された1台のモーターに渡す。 */

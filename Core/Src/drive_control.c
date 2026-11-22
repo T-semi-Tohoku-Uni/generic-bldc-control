@@ -89,8 +89,11 @@ typedef enum {
     DRIVE_COMMAND_LOCAL
 } DriveCommandSource;
 
-static const DriveCommandSource drive_command_source = DRIVE_COMMAND_LOCAL;
-static const DriveControlMode control_motor_mode = CONTROL_CURRENT_PI;
+/* CANは受信した目標rpmと方式を使う。LOCALは次の2つの設定を使う。 */
+static const DriveCommandSource drive_command_source = DRIVE_COMMAND_CAN;
+static const DriveControlMode local_control_mode = CONTROL_CURRENT_PI;
+static const float local_speed_target_rpm = 200.0f;
+static volatile DriveControlMode control_motor_mode = CONTROL_CURRENT_PI;
 
 volatile uint32_t rx_ok_count = 0;
 
@@ -104,6 +107,9 @@ enum {
 };
 static volatile uint8_t drive_state;
 static volatile uint32_t drive_last_rx_ms;
+static volatile float can_speed_target_rpm;  // CAN割り込みからTIM2へ渡す目標rpm
+
+static void initialize_motor_variables(void);
 static volatile uint32_t tim2_cnt = 0;
 
 volatile uint8_t encoder_fault = 0;
@@ -192,22 +198,35 @@ void drive_accept_can_command(float speed_target, uint8_t requested_pid_mode, ui
      * WAITは最初の指令を待つ状態。受理済みの状態で300 ms経過したら、
      * TIM2がSTOPにする前であっても新しい指令は受理しない。
      */
-    uint32_t now = HAL_GetTick();
-    uint8_t state = drive_state;
-
-    if (requested_control_mode != (uint8_t)control_motor_mode ||
-        state == DRIVE_LOCAL || state == DRIVE_CAN_STOP ||
-        (state != DRIVE_CAN_WAIT && now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS)) {
+    if (drive_command_source != DRIVE_COMMAND_CAN) {
         return;
     }
 
-    motor_speed_target = speed_target;
-    pid_mode = requested_pid_mode ? 1 : 0;
+    uint32_t now = HAL_GetTick();
+    uint8_t state = drive_state;
 
-    /* 前回の値を確認し、次この関数が呼ばれた時のnowと比較することによってtimeoutでないか確認 */
+    if (state != DRIVE_CAN_WAIT && state != DRIVE_CAN_ARM && state != DRIVE_CAN_RUN) {
+        return;
+    }
+
+    const DriveControlMode mode = (DriveControlMode)requested_control_mode;
+    const uint8_t selected_pid = mode == CONTROL_VOLTAGE ? requested_pid_mode : 0U;
+
+    /* 最初の指令で方式を決める。運転中は同じ方式の速度指令だけを受ける。 */
+    if (state != DRIVE_CAN_WAIT &&
+        (now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS ||
+         mode != control_motor_mode || selected_pid != pid_mode)) {
+        return;
+    }
+
+    /* 指令が有効なときだけ、目標rpmと通信監視の時刻を更新する。 */
+    can_speed_target_rpm = speed_target;
     drive_last_rx_ms = now;
+
     /* DRIVE_CAN_WAIT は起動後の最初の指令を待つ状態 */
     if (state == DRIVE_CAN_WAIT) {
+        control_motor_mode = mode;
+        pid_mode = selected_pid;
         drive_state = DRIVE_CAN_ARM;
     }
     rx_ok_count++;
@@ -416,7 +435,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         }
 
         if (state == DRIVE_CAN_ARM) {
-            __HAL_TIM_MOE_ENABLE(&htim1);
+            /* 最初のCAN指令で選んだ方式・PIDのゲインをPWM有効化前に設定する。 */
+            initialize_motor_variables();
+        }
+
+        if (state == DRIVE_CAN_ARM || state == DRIVE_CAN_RUN) {
+            /* 初期化で入る単体用の目標を、加減速処理の前にCANの目標で上書きする。 */
+            motor_speed_target = can_speed_target_rpm;
+        }
+
+        if (state == DRIVE_CAN_ARM) {
+            __HAL_TIM_MOE_ENABLE(&htim1);  // TIM1のPWM出力を許可する命令
             drive_state = DRIVE_CAN_RUN;
         }
 
@@ -636,7 +665,7 @@ static void align_motor_encoder(void)
 
   /* U相とV・W相に差を作ると、ローターが磁界の向きにそろう。1秒後のAS5047Pの角度を読み、通信とドライバ状態が正常なら、その位置を zero_offset_rad に */
   set_pwm(0.58f, 0.46f, 0.46f);  // U相とV・W相に電圧差を作り、ローターを一定方向に固定する。
-  HAL_Delay(1000);               // 落ち着くまで1秒待ち、その位置を電気角のゼロ点にする。
+  HAL_Delay(1000);                   // 落ち着くまで1秒待ち、その位置を電気角のゼロ点にする。
 
   uint16_t align_after = as5047p_read_angle_checked(&align_bad_after);
 
@@ -684,8 +713,9 @@ void drive_init(void)
   printf("step1: peripherals init done\r\n");
 
   
-  if (drive_command_source == DRIVE_COMMAND_CAN && control_motor_mode != CONTROL_VOLTAGE) {
-    drive_startup_failed("CONFIG ERROR: CAN requires voltage control");
+  if (drive_command_source == DRIVE_COMMAND_LOCAL) {
+    /* 単体試験の方式を先に選び、既存の初期化で対応するゲインを設定する。 */
+    control_motor_mode = local_control_mode;
   }
   initialize_motor_variables();
 
@@ -744,9 +774,10 @@ void drive_init(void)
   set_pwm(0.5f, 0.5f, 0.5f);
 
   if (drive_command_source == DRIVE_COMMAND_LOCAL) {
+    motor_speed_target = local_speed_target_rpm;
     drive_state = DRIVE_LOCAL;
   } else {
-    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);
+    __HAL_TIM_MOE_DISABLE_UNCONDITIONALLY(&htim1);  // TIM1のPWM出力を止める 、TIM1はモーター用のPWMを作ることと、ADCの電流測定タイミングを決めることに使っている
     drive_state = DRIVE_CAN_WAIT;
   }
 
