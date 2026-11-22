@@ -47,7 +47,7 @@ void FDCAN1_ConfigFilterAndStart(void)
     {
         Error_Handler();
     }
-    /* NEW_MESSAGEでRX FIFO 0の新着割り込みを有効にする。
+    /* NEW_MESSAGEでRX FIFO 0の新着割り込みを有効にする。 HAL_FDCAN_RxFifo0Callbackを結果として呼び出す
      * 割り込みを受けたHALが下のコールバックを呼び、GetRxMessage()で取り出す。
      */
     if (HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK)

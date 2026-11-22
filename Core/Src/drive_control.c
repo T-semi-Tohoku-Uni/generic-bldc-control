@@ -19,12 +19,21 @@ extern TIM_HandleTypeDef htim3;
 #define PWM_PERIOD 3999  // TIM1が上向きに数えるときの上限。
 #define POLE_PAIRS 7     // ローター上のN極・S極の組の数。
 #define CURRENT_SHUNT_OHMS 0.001    //電流計測に用いる抵抗値
-#define CURRENT_OPAMP_GAIN 16.0                 //cudemxで設定した値
-#define MAX_PHASE_CURRENT_A 30.0f
+#define CURRENT_OPAMP_GAIN 16.0            //cudemxで設定した値
+#define MAX_PHASE_CURRENT_A 40.0f         
 #define ADC_REFERENCE_V 3.3               //マイコンの駆動電圧
 #define ENCODER_FAULT_THRESHOLD 30    // スコアがここまで貯まったら停止
 #define ENCODER_FAULT_SCORE_MAX 30    // スコアの上限
 #define DRIVE_CAN_TIMEOUT_MS 300U
+
+/* 各基板のシャント信号の伝達率。電流計測と過電流判定の換算に */
+#define LEGACY_CURRENT_SENSE_RATIO 1.0f
+#define V3_CURRENT_SENSE_RATIO 0.94f
+
+/* 速度PI制御パラメーター */
+#define SPEED_PI_KP          0.005f  // A/rpm
+#define SPEED_PI_KI          0.020f  // A/(rpm・s)
+#define SPEED_PI_IQ_LIMIT_A  40.0f    // 初回試験用のIq指令上限 [A]
 
 typedef enum {
     DRIVE_BOARD_V2,
@@ -34,9 +43,7 @@ typedef enum {
 /* 実際に接続する基板に合わせて選ぶ */
 static const DriveBoardMode motor_board_mode = DRIVE_BOARD_V3;
 
-/* 各基板のシャント信号の伝達率。電流計測と過電流判定の換算に */
-#define LEGACY_CURRENT_SENSE_RATIO 1.0f
-#define V3_CURRENT_SENSE_RATIO 0.94f
+
 
 volatile float motor_speed;
 float motor_p;
@@ -130,6 +137,7 @@ static volatile uint32_t adc_u_max = 0U;
 static volatile uint32_t adc_w_min = 4095U;
 static volatile uint32_t adc_w_max = 0U;
 
+/* ADCが測った値をそのまま記録して、最小値と最大値を更新する関数 */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance != ADC1) {
@@ -315,8 +323,10 @@ static void update_openloop(float voltage)
         motor_speed = filtered_speed;
     }
 
+    /* モーターに対して、マイコンが直接変えられるのは PWMでかける電圧であり、それを速度差か、電流値の差で計算している */
     float vd;
     float vq;
+
     /*電圧制御*/
     if (control_motor_mode == CONTROL_VOLTAGE) {
 
@@ -328,7 +338,7 @@ static void update_openloop(float voltage)
 
     /*電流制御*/
     if (control_motor_mode == CONTROL_CURRENT_PI){
-        const float voltage_limit = 0.10f; //単体試験用の正規化電圧上限
+        const float voltage_limit = 0.10f; 
 
         measure_current();
         if (overcurrent_fault) {
@@ -341,13 +351,14 @@ static void update_openloop(float voltage)
         vd = locate_pid( motor_current_d, motor_current_d_target, motor_current_d_pgain, motor_current_d_igain, 0.0f, &motor_current_d_different_sum, &motor_current_d_low_pass_different_sum, &motor_current_d_last_difference, cutoff);
         vq = locate_pid( motor_current_p, motor_current_p_target, motor_current_p_pgain, motor_current_p_igain, 0.0f, &motor_current_p_different_sum, &motor_current_p_low_pass_different_sum, &motor_current_p_last_difference, cutoff);
 
-        /* 電圧が上限に達しているとき、PIの積分がさらに溜まりすぎるのを防ぐ処理 pidが正しい方向にいっているか確認 */
         const float voltage_sq = vd * vd + vq * vq;
-
+        
         if (voltage_sq > voltage_limit * voltage_limit) {
+          /* 電圧が上限に達しているとき、PIの積分がさらに溜まりすぎるのを防ぐ処理 pidが正しい方向にいっているか確認 */
           const float delta_vd_i = motor_current_d_igain * (motor_current_d_different_sum - id_sum_before);
           const float delta_vq_i = motor_current_p_igain * (motor_current_p_different_sum - iq_sum_before);
 
+          /* 今回の積分更新が電圧指令をさらに外向きに押すなら、次回に持ち越す積分値を、両軸とも更新前に戻す。*/
           if (vd * delta_vd_i + vq * delta_vq_i > 0.0f) {
             motor_current_d_different_sum = id_sum_before;
             motor_current_p_different_sum = iq_sum_before;
@@ -409,11 +420,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             drive_state = DRIVE_CAN_RUN;
         }
 
-        if (control_motor_mode == CONTROL_CURRENT_PI) {
-          update_openloop(0.0f);
-          return;
-        }
-
         /*最初電流差でがたがたいうので速度目標を少しずつ上げることで回避したい*/
         if (motor_speed_target == 0.0f) {
           /* ドリフト防止 */
@@ -444,6 +450,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
         float voltage_out = 0.0f;  // ← スコープを外に出す
 
+        if (control_motor_mode == CONTROL_CURRENT_PI) {
+          const float measured_rpm = motor_speed;
+          const float target_rpm = motor_now_speed_target;
+          const float speed_error = target_rpm - measured_rpm;
+          const float integral_before = motor_different_sum;
+ 
+          // 既存の位置型PIDを、Dゲイン0の速度PIとして使う。
+          // 戻り値はIqの指令 [A]。
+          const float iq_request = locate_pid(measured_rpm,target_rpm,SPEED_PI_KP,SPEED_PI_KI,0.0f, &motor_different_sum, &motor_low_pass_different_sum, &motor_last_difference, cutoff);
+
+          // Iqが上限に当たり、積分がさらに同じ方向に増えるなら、
+          // 次の周期に持ち越す積分値を更新前に戻す。
+          if ((iq_request >  SPEED_PI_IQ_LIMIT_A && speed_error > 0.0f) || (iq_request < -SPEED_PI_IQ_LIMIT_A && speed_error < 0.0f)) {
+            motor_different_sum = integral_before;
+          }
+
+          motor_current_p_target = fmaxf(-SPEED_PI_IQ_LIMIT_A, fminf(SPEED_PI_IQ_LIMIT_A, iq_request));
+
+          update_openloop(0.0f);
+          return;
+        }
+
         if (pid_mode == 0) {
           voltage_out = locate_pid( motor_speed, motor_now_speed_target, motor_p, motor_i, motor_d, &motor_different_sum, &motor_low_pass_different_sum, &motor_last_difference, cutoff);
         }
@@ -466,7 +494,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 static void initialize_motor_variables(void)
 {
   motor_speed = 0.0;
-  motor_speed_target = 0.0;
+  motor_speed_target = (control_motor_mode == CONTROL_CURRENT_PI) ? 200.0f : 0.0f;
   if (pid_mode == 0) {
     /* N2830を使用していたときの速度PID設定（参考）
      * motor_p = 37.0;
@@ -497,7 +525,8 @@ static void initialize_motor_variables(void)
   motor_current_d = 0.0;
   motor_current_p = 0.0;
   motor_current_d_target = 0.0;
-  motor_current_p_target = 2.0f;  // Iqの初期目標 [A]
+  motor_current_p_target = 0.0f;  // Iqの初期目標 [A]
+  
   motor_current_d_different_sum = 0.0;
   motor_current_d_low_pass_different_sum = 0.0;
   motor_current_d_last_difference = 0.0;      //currentは電流といういみ　現在ではない
@@ -538,13 +567,12 @@ static void start_motor_pwm(void)
 
 static void start_current_measurement(void)
 {
-  // ADC回路自体の誤差を校正する。電流のゼロ点は後で測る。
+  // STM32内部のADCが持つ読み取りのずれを補正 電流のゼロ点は後で測る。
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 
   printf("step6: ADC calibrated\r\n");
-
-  // OPAMPスタート アナログ信号を増幅する回路を開始
+  // OPAMPスタート アナログ信号を増幅する回路 シャント抵抗に生じる小さな電圧を、ADCが読み取りやすい大きさに増幅
   HAL_OPAMP_Start(&hopamp1);
   HAL_OPAMP_Start(&hopamp2);
   HAL_OPAMP_Start(&hopamp3);
@@ -553,7 +581,7 @@ static void start_current_measurement(void)
 
   printf("step7: OPAMP started\r\n");
 
-  // 設定済みのInjected変換を割り込みなしで開始し、ゼロ点を測る。
+  // 設定済みのInjected変換を割り込みなしで開始し、ゼロ点を測る。Injected変換は、STM32のADCにこの合図が来たら、この入力を優先して測ってと設定できる測定方式
   HAL_ADCEx_InjectedStart(&hadc2);
   HAL_ADCEx_InjectedStart(&hadc1);
 
@@ -566,12 +594,12 @@ static void start_current_measurement(void)
 
   for (int i = 0; i < 100; i++) {
     HAL_Delay(1); // 次のADC測定を待ち、指定したRank（測定順）の結果を読む。
-    sum_u += HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
-    sum_v += HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
+    sum_u += HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);  // ADCがすでに測って保存した値を読み出す関数
+    sum_v += HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);  
     sum_w += HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_2);
   }
 
-  offset_u = sum_u / 100;
+  offset_u = sum_u / 100;  // offset は、実際の電流が 0 A のときにADCが返す値
   offset_v = sum_v / 100;
   offset_w = sum_w / 100;
 
@@ -588,7 +616,7 @@ static void start_current_measurement(void)
   HAL_ADCEx_InjectedStop(&hadc1);
   HAL_ADCEx_InjectedStop(&hadc2);
 
-  // ゼロ点を求めた後、変換完了割り込み付きで再開する。
+  // ゼロ点を求めた後、変換完了割り込み付きで再開する。 HAL_ADCEx_InjectedConvCpltCallback()を呼ぶ
   HAL_ADCEx_InjectedStart_IT(&hadc2);
   HAL_ADCEx_InjectedStart_IT(&hadc1);
 
