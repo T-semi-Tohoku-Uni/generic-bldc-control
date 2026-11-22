@@ -31,8 +31,8 @@ extern TIM_HandleTypeDef htim3;
 #define V3_CURRENT_SENSE_RATIO 0.94f
 
 /* 速度PI制御パラメーター */
-#define SPEED_PI_KP          0.005f  // A/rpm
-#define SPEED_PI_KI          0.020f  // A/(rpm・s)
+#define SPEED_PI_KP          0.025f  // A/rpm
+#define SPEED_PI_KI          0.120f  // A/(rpm・s)
 #define SPEED_PI_IQ_LIMIT_A  40.0f    // 初回試験用のIq指令上限 [A]
 
 typedef enum {
