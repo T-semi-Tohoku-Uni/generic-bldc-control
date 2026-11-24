@@ -523,7 +523,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 static void initialize_motor_variables(void)
 {
   motor_speed = 0.0;
-  motor_speed_target = (control_motor_mode == CONTROL_CURRENT_PI) ? 200.0f : 0.0f;
+  motor_speed_target = 0.0f;
   if (pid_mode == 0) {
     /* N2830を使用していたときの速度PID設定（参考）
      * motor_p = 37.0;
