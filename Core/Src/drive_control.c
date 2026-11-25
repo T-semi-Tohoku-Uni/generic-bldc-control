@@ -33,7 +33,11 @@ extern TIM_HandleTypeDef htim3;
 /* 速度PI制御パラメーター */
 #define SPEED_PI_KP          0.025f  // A/rpm
 #define SPEED_PI_KI          0.120f  // A/(rpm・s)
-#define SPEED_PI_IQ_LIMIT_A  40.0f    // 初回試験用のIq指令上限 [A]
+#define IQ_LIMIT_A  40.0f    // Iq指令上限 [A]
+
+#define ANGLE_KP_RPM_PER_RAD   250.00f  // 角度誤差1 radあたりの速度指令 [rpm]
+#define ANGLE_SPEED_LIMIT_RPM  100.0f  // 角度制御で要求できる速度
+
 
 typedef enum {
     DRIVE_BOARD_V2,
@@ -80,7 +84,8 @@ volatile int pid_mode = 0;             //0ならlocate_pid 1ならspeed_pid
 /* 制御方式 */
 typedef enum {
     CONTROL_VOLTAGE = 0,
-    CONTROL_CURRENT_PI = 1
+    CONTROL_CURRENT_PI = 1,
+    CONTROL_ANGLE = 2
 } DriveControlMode;
 
 /* CAN指令を待つか、コードで指定した目標で単体試験するか */
@@ -90,10 +95,11 @@ typedef enum {
 } DriveCommandSource;
 
 /* CANは受信した目標rpmと方式を使う。LOCALは次の2つの設定を使う。 */
-static const DriveCommandSource drive_command_source = DRIVE_COMMAND_CAN;
-static const DriveControlMode local_control_mode = CONTROL_CURRENT_PI;
+static const DriveCommandSource drive_command_source = DRIVE_COMMAND_LOCAL;
+static const DriveControlMode local_control_mode = CONTROL_ANGLE;
 static const float local_speed_target_rpm = 200.0f;
-static volatile DriveControlMode control_motor_mode = CONTROL_CURRENT_PI;
+static const float local_angle_target_deg = 10.0f;
+static volatile DriveControlMode control_motor_mode = CONTROL_ANGLE;
 
 volatile uint32_t rx_ok_count = 0;
 
@@ -110,6 +116,7 @@ static volatile uint32_t drive_last_rx_ms;
 static volatile float can_speed_target_rpm;  // CAN割り込みからTIM2へ渡す目標rpm
 
 static void initialize_motor_variables(void);
+static float speed_pi_to_iq(float target_rpm, float iq_limit_a);
 static volatile uint32_t tim2_cnt = 0;
 
 volatile uint8_t encoder_fault = 0;
@@ -142,6 +149,7 @@ static volatile uint32_t adc_u_min = 4095U;
 static volatile uint32_t adc_u_max = 0U;
 static volatile uint32_t adc_w_min = 4095U;
 static volatile uint32_t adc_w_max = 0U;
+
 
 /* ADCが測った値をそのまま記録して、最小値と最大値を更新する関数 */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
@@ -213,9 +221,7 @@ void drive_accept_can_command(float speed_target, uint8_t requested_pid_mode, ui
     const uint8_t selected_pid = mode == CONTROL_VOLTAGE ? requested_pid_mode : 0U;
 
     /* 最初の指令で方式を決める。運転中は同じ方式の速度指令だけを受ける。 */
-    if (state != DRIVE_CAN_WAIT &&
-        (now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS ||
-         mode != control_motor_mode || selected_pid != pid_mode)) {
+    if (state != DRIVE_CAN_WAIT && (now - drive_last_rx_ms >= DRIVE_CAN_TIMEOUT_MS || mode != control_motor_mode || selected_pid != pid_mode)) {
         return;
     }
 
@@ -355,8 +361,27 @@ static void update_openloop(float voltage)
 
     }
 
-    /*電流制御*/
-    if (control_motor_mode == CONTROL_CURRENT_PI){
+    /* 電流制御 or 角度制御 */
+    if (control_motor_mode == CONTROL_CURRENT_PI || control_motor_mode == CONTROL_ANGLE) {
+
+        if (control_motor_mode == CONTROL_ANGLE) {
+          const float target_rad = local_angle_target_deg * ((float)M_PI / 180.0f); // 度からラジアンに
+          float error_rad = target_rad - angle_mech;                                // ラジアン差
+
+          // 0°と360°の境界をまたいでも、短い方向へ回す。
+          if (error_rad > (float)M_PI) {
+            error_rad -= 2.0f * (float)M_PI;
+          } else if (error_rad < -(float)M_PI) {
+            error_rad += 2.0f * (float)M_PI;
+          }
+
+          // 角度差が大きいときは速く、目標に近づくにつれて遅くする。
+          const float rpm_request = ANGLE_KP_RPM_PER_RAD * error_rad;
+          const float target_rpm = fmaxf( -ANGLE_SPEED_LIMIT_RPM, fminf(ANGLE_SPEED_LIMIT_RPM, rpm_request)); // rpmの絶対値がANGLE_SPEED_LIMIT_RPMになるようにする その範囲内ならrpm_request
+
+          motor_current_p_target = speed_pi_to_iq(target_rpm, IQ_LIMIT_A);
+        }
+
         const float voltage_limit = 0.10f; 
 
         measure_current();
@@ -404,6 +429,23 @@ static void update_openloop(float voltage)
 
 }
 
+/* iqの目標を求める */
+static float speed_pi_to_iq(float target_rpm, float iq_limit_a)
+{
+    const float measured_rpm = motor_speed;
+    const float speed_error = target_rpm - measured_rpm;
+    const float integral_before = motor_different_sum;
+
+    const float iq_request = locate_pid(measured_rpm, target_rpm, SPEED_PI_KP, SPEED_PI_KI, 0.0f,&motor_different_sum, &motor_low_pass_different_sum,&motor_last_difference, cutoff);
+
+    // Iqが上限に達し、積分がさらに同じ方向へ増える場合は元に戻す。
+    if ((iq_request > iq_limit_a && speed_error > 0.0f) || (iq_request < -iq_limit_a && speed_error < 0.0f)) {
+        motor_different_sum = integral_before;
+    }
+
+    return fmaxf(-iq_limit_a, fminf(iq_limit_a, iq_request));
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
 
@@ -449,6 +491,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             drive_state = DRIVE_CAN_RUN;
         }
 
+        if (control_motor_mode == CONTROL_ANGLE) {
+          update_openloop(0.0f);
+          return;
+        }
+
         /*最初電流差でがたがたいうので速度目標を少しずつ上げることで回避したい*/
         if (motor_speed_target == 0.0f) {
           /* ドリフト防止 */
@@ -480,23 +527,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         float voltage_out = 0.0f;  // ← スコープを外に出す
 
         if (control_motor_mode == CONTROL_CURRENT_PI) {
-          const float measured_rpm = motor_speed;
-          const float target_rpm = motor_now_speed_target;
-          const float speed_error = target_rpm - measured_rpm;
-          const float integral_before = motor_different_sum;
- 
-          // 既存の位置型PIDを、Dゲイン0の速度PIとして使う。
-          // 戻り値はIqの指令 [A]。
-          const float iq_request = locate_pid(measured_rpm,target_rpm,SPEED_PI_KP,SPEED_PI_KI,0.0f, &motor_different_sum, &motor_low_pass_different_sum, &motor_last_difference, cutoff);
-
-          // Iqが上限に当たり、積分がさらに同じ方向に増えるなら、
-          // 次の周期に持ち越す積分値を更新前に戻す。
-          if ((iq_request >  SPEED_PI_IQ_LIMIT_A && speed_error > 0.0f) || (iq_request < -SPEED_PI_IQ_LIMIT_A && speed_error < 0.0f)) {
-            motor_different_sum = integral_before;
-          }
-
-          motor_current_p_target = fmaxf(-SPEED_PI_IQ_LIMIT_A, fminf(SPEED_PI_IQ_LIMIT_A, iq_request));
-
+          motor_current_p_target = speed_pi_to_iq(motor_now_speed_target, IQ_LIMIT_A);
           update_openloop(0.0f);
           return;
         }
@@ -567,6 +598,12 @@ static void initialize_motor_variables(void)
     motor_current_d_igain = 0.10f;
     motor_current_p_pgain = 0.015f;
     motor_current_p_igain = 2.5f;
+  }
+  if (control_motor_mode == CONTROL_ANGLE) {
+    motor_current_d_pgain = 0.020f;
+    motor_current_d_igain = 0.10f;
+    motor_current_p_pgain = 0.03f;
+    motor_current_p_igain = 4.0f;
   }
   cutoff = 8;
 }
