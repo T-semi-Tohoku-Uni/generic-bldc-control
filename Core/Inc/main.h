@@ -61,7 +61,6 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define USER_SW_Pin GPIO_PIN_13
 #define USER_SW_GPIO_Port GPIOC
-#define USER_SW_EXTI_IRQn EXTI15_10_IRQn
 #define k_Pin GPIO_PIN_0
 #define k_GPIO_Port GPIOA
 #define WAKE_Pin GPIO_PIN_7

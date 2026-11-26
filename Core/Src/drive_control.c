@@ -95,7 +95,7 @@ typedef enum {
 } DriveCommandSource;
 
 /* CANは受信した目標rpmと方式を使う。LOCALは次の2つの設定を使う。 */
-static const DriveCommandSource drive_command_source = DRIVE_COMMAND_LOCAL;
+static const DriveCommandSource drive_command_source = DRIVE_COMMAND_CAN;
 static const DriveControlMode local_control_mode = CONTROL_ANGLE;
 static const float local_speed_target_rpm = 200.0f;
 static const float local_angle_target_deg = 10.0f;
@@ -109,11 +109,31 @@ enum {
     DRIVE_CAN_WAIT,  // 最初の有効なCAN指令を待つ。
     DRIVE_CAN_ARM,   // 最初の指令を受理。次のTIM2周期でPWMを有効にする準備。
     DRIVE_CAN_RUN,   // CAN指令に従って速度を制御する。
-    DRIVE_CAN_STOP   // 通信断でPWMを止め、リセットまで保持する。
+    DRIVE_CAN_STOP,  // 通信断でPWMを止め、リセットまで保持する。
+    DRIVE_CAN_CONFIG // PWMを止めたままCAN IDを保存する。
 };
 static volatile uint8_t drive_state;
 static volatile uint32_t drive_last_rx_ms;
 static volatile float can_speed_target_rpm;  // CAN割り込みからTIM2へ渡す目標rpm
+
+/* 最初のCAN指令を受ける前に限り、PWMを止めた状態でIDを保存する。 */
+uint8_t drive_begin_can_id_change(void)
+{
+    const uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    const uint8_t allowed = drive_command_source == DRIVE_COMMAND_CAN &&
+                            drive_state == DRIVE_CAN_WAIT;
+    if (allowed) {
+        drive_state = DRIVE_CAN_CONFIG;
+    }
+    __set_PRIMASK(mask);
+    return allowed;
+}
+
+void drive_end_can_id_change(void)
+{
+    drive_state = DRIVE_CAN_WAIT;
+}
 
 static void initialize_motor_variables(void);
 static float speed_pi_to_iq(float target_rpm, float iq_limit_a);
@@ -468,7 +488,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             motor_now_speed_target = 0.0f;
             /* DRIVE_CAN_STOP stays latched until reset, which reinitializes the PID. */
         }
-        if (timed_out || state == DRIVE_CAN_WAIT || state == DRIVE_CAN_STOP) {
+        if (timed_out || state == DRIVE_CAN_WAIT ||
+            state == DRIVE_CAN_STOP || state == DRIVE_CAN_CONFIG) {
             return;
         }
 

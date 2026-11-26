@@ -7,6 +7,8 @@
 
 void drive_init(void);
 void drive_report(void);
+uint8_t drive_begin_can_id_change(void);
+void drive_end_can_id_change(void);
 
 /* Called from the FDCAN RX interrupt after validating a command. */
 void drive_accept_can_command(float speed_target, uint8_t requested_pid_mode, uint8_t requested_control_mode);

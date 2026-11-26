@@ -2,13 +2,19 @@
 #include "drive_control.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
-extern FDCAN_HandleTypeDef hfdcan1;
-
-#define CAN_MOTOR_CMD_BASE_ID 0x302u
+#define DRIVE_CAN_ID_FIRST  0x301u
+#define DRIVE_CAN_ID_LAST   0x303u
+#define DRIVE_CAN_ID_FLASH  0x0801F000u
+#define DRIVE_CAN_ID_MAGIC  0x43414E49u
+#define USER_SW_DEBOUNCE_MS 50u
 #define DRIVE_MAX_RPM 2000.0f
 
+extern FDCAN_HandleTypeDef hfdcan1;
+static volatile uint32_t drive_can_id = DRIVE_CAN_ID_FIRST;
+static volatile uint8_t pending_presses;
 typedef struct __attribute__((packed)) {
     float   speed_target;               /* byte0-3 */
     uint8_t pid_mode;                   /* byte4: 0=locate_pid, 1=speed_pid 1ではなぜか上手くいかないので0を用いて*/
@@ -16,9 +22,116 @@ typedef struct __attribute__((packed)) {
     uint8_t reserved[2];                /* byte6-7 */
 } can_motor_cmd_t;
 
+static uint32_t load_can_id(void);
+static HAL_StatusTypeDef save_can_id(uint32_t id);
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin);
+void drive_can_button_task(void);
+
+static uint32_t load_can_id(void)
+{
+    const uint64_t record = *(const volatile uint64_t *)DRIVE_CAN_ID_FLASH;
+    const uint32_t id = (uint32_t)record;
+    const uint32_t magic = (uint32_t)(record >> 32);
+
+    if (magic == DRIVE_CAN_ID_MAGIC &&
+        id >= DRIVE_CAN_ID_FIRST && id <= DRIVE_CAN_ID_LAST) {
+        return id;
+    }
+
+    return DRIVE_CAN_ID_FIRST;
+}
+
+static HAL_StatusTypeDef save_can_id(uint32_t id)
+{
+    const uint64_t record = ((uint64_t)DRIVE_CAN_ID_MAGIC << 32) | id;
+    FLASH_EraseInitTypeDef erase = {0};
+    uint32_t page_error;
+
+    erase.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase.Banks = FLASH_BANK_1;
+    erase.Page = (DRIVE_CAN_ID_FLASH - FLASH_BASE) / FLASH_PAGE_SIZE;
+    erase.NbPages = 1u;
+
+    HAL_StatusTypeDef status = HAL_FLASH_Unlock();
+    if (status != HAL_OK) {
+        return status;
+    }
+
+    status = HAL_FLASHEx_Erase(&erase, &page_error);
+    if (status == HAL_OK) {
+        status = HAL_FLASH_Program(
+            FLASH_TYPEPROGRAM_DOUBLEWORD, DRIVE_CAN_ID_FLASH, record);
+    }
+
+    HAL_FLASH_Lock();
+
+    if (status == HAL_OK &&
+        *(const volatile uint64_t *)DRIVE_CAN_ID_FLASH != record) {
+        return HAL_ERROR;
+    }
+    return status;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    static uint32_t last_press_ms;
+    static uint8_t has_pressed;
+
+    if (GPIO_Pin != USER_SW_Pin) {
+        return;
+    }
+
+    const uint32_t now = HAL_GetTick();
+    if (has_pressed && now - last_press_ms < USER_SW_DEBOUNCE_MS) {
+        return;
+    }
+
+    last_press_ms = now;
+    has_pressed = 1u;
+
+    if (pending_presses < UINT8_MAX) {
+        pending_presses++;
+    }
+}
+
+void drive_can_button_task(void)
+{
+    printf("\r\ncan_id=0x%03lX\r\n", (unsigned long)drive_can_id);
+
+    const uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    const uint8_t pressed = pending_presses != 0u;
+    if (pressed) {
+        pending_presses--;
+    }
+    __set_PRIMASK(mask);
+
+    if (!pressed || !drive_begin_can_id_change()) {
+        return;
+    }
+
+    const uint32_t next = (drive_can_id == DRIVE_CAN_ID_LAST)
+                        ? DRIVE_CAN_ID_FIRST : drive_can_id + 1u;
+
+    const HAL_StatusTypeDef status = save_can_id(next);
+    if (status == HAL_OK) {
+        drive_can_id = next;
+    }
+
+    drive_end_can_id_change();
+
+    if (status == HAL_OK) {
+        printf("CAN ID saved: 0x%03lX\r\n", (unsigned long)next);
+    } else {
+        printf("CAN ID save failed\r\n");
+    }
+}
+
 /* 平ドラがどのCANメッセージを受け取るかを設定し、FDCAN1を起動する関数 MX_FDCAN1_Init() の末尾にある1行で呼び出される*/
 void FDCAN1_ConfigFilterAndStart(void)
 {
+    drive_can_id = load_can_id();
+
     FDCAN_FilterTypeDef sFilterConfig;
 
     /* 0x301～0x303は各基板に割り当てるID。この基板では設定した1つを通す。
@@ -28,10 +141,10 @@ void FDCAN1_ConfigFilterAndStart(void)
      */
     sFilterConfig.IdType       = FDCAN_STANDARD_ID;
     sFilterConfig.FilterIndex  = 0;
-    sFilterConfig.FilterType   = FDCAN_FILTER_DUAL;
+    sFilterConfig.FilterType   = FDCAN_FILTER_RANGE;
     sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    sFilterConfig.FilterID1    = CAN_MOTOR_CMD_BASE_ID;
-    sFilterConfig.FilterID2    = CAN_MOTOR_CMD_BASE_ID;
+    sFilterConfig.FilterID1    = DRIVE_CAN_ID_FIRST;
+    sFilterConfig.FilterID2    = DRIVE_CAN_ID_LAST;
 
     /* 構造体で組み立てたIDフィルタをHAL経由でFDCAN1へ登録する。 */
     if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
@@ -81,7 +194,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     }
 
     /* この基板向けのClassic CAN速度指令か確認する。 設定1つ1つ確認 */
-    if (RxHeader.IdType != FDCAN_STANDARD_ID || RxHeader.Identifier != CAN_MOTOR_CMD_BASE_ID || RxHeader.RxFrameType != FDCAN_DATA_FRAME || RxHeader.FDFormat != FDCAN_CLASSIC_CAN || RxHeader.BitRateSwitch != FDCAN_BRS_OFF || RxHeader.DataLength != FDCAN_DLC_BYTES_8) {
+    if (RxHeader.IdType != FDCAN_STANDARD_ID || RxHeader.Identifier != drive_can_id || RxHeader.RxFrameType != FDCAN_DATA_FRAME || RxHeader.FDFormat != FDCAN_CLASSIC_CAN || RxHeader.BitRateSwitch != FDCAN_BRS_OFF || RxHeader.DataLength != FDCAN_DLC_BYTES_8) {
         return;
     }
 
